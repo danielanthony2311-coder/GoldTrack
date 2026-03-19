@@ -2,6 +2,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
+import dotenv from "dotenv";
 import pg from "pg";
 import axios from "axios";
 import * as XLSX from "xlsx";
@@ -9,6 +10,9 @@ import fs from "fs";
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse');
+
+// Load .env.local before anything reads process.env
+dotenv.config({ path: ".env.local" });
 
 const { Pool } = pg;
 
