@@ -78,7 +78,13 @@ export default function ComexDetails() {
     setIsSyncing(true);
     try {
       const response = await fetch('/api/cme/sync');
-      if (!response.ok) throw new Error('Sync failed');
+      const syncResult = await response.json();
+      if (!response.ok || !syncResult.success) {
+        const detail = syncResult.errors?.length
+          ? syncResult.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n')
+          : 'Sync failed';
+        throw new Error(detail);
+      }
       
       await fetchData();
       setRefreshKey(prev => prev + 1);

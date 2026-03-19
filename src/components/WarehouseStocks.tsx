@@ -79,9 +79,12 @@ export default function WarehouseStocks() {
       const result = await response.json();
       
       setDebugInfo(result);
-      
+
       if (!response.ok || !result.success) {
-        throw new Error(result.error || 'CME Sync failed');
+        const detail = result.errors?.length
+          ? result.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n')
+          : 'CME Sync failed';
+        throw new Error(detail);
       }
       
       await fetchData();
