@@ -38,10 +38,15 @@ export default function MiningSynergy() {
           <div className="flex flex-col">
             <span className="text-[10px] text-zinc-500 uppercase font-black tracking-wider">Spot Gold Price</span>
             <div className="flex items-center gap-3">
-              <input 
-                type="number" 
-                value={spotGold} 
-                onChange={(e) => setSpotGold(Number(e.target.value))}
+              <input
+                type="number"
+                value={spotGold}
+                min={0}
+                max={100000}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  if (!isNaN(val) && val >= 0) setSpotGold(val);
+                }}
                 className="bg-transparent text-2xl font-black text-gold-500 w-24 focus:outline-none"
               />
               <span className="text-gold-500/50 font-bold">USD/oz</span>

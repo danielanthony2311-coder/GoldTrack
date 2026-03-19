@@ -24,25 +24,33 @@ export default function Dashboard() {
     const fetchData = async () => {
       setLoading(true);
       try {
-        // Fetch Latest Stocks
-        const stocksRes = await fetch(`/api/cme/latest-stocks?metal=${metal}`);
-        const stocksData = await stocksRes.json();
+        // Fetch all three in parallel
+        const [stocksRes, summaryRes, noticesRes] = await Promise.all([
+          fetch(`/api/cme/latest-stocks?metal=${metal}`),
+          fetch(`/api/cme/summary?metal=${metal}&type=DAILY`),
+          fetch(`/api/cme/latest-notices?metal=${metal}`),
+        ]);
+
+        if (!stocksRes.ok) throw new Error(`Stocks API error: ${stocksRes.status}`);
+        if (!summaryRes.ok) throw new Error(`Summary API error: ${summaryRes.status}`);
+        if (!noticesRes.ok) throw new Error(`Notices API error: ${noticesRes.status}`);
+
+        const [stocksData, summaryData, noticesData] = await Promise.all([
+          stocksRes.json(),
+          summaryRes.json(),
+          noticesRes.json(),
+        ]);
+
         if (stocksData && stocksData.length > 0) {
           setLatestStocks(stocksData[stocksData.length - 1]);
         }
 
-        // Fetch Daily Deliveries and Settlement
-        const summaryRes = await fetch(`/api/cme/summary?metal=${metal}&type=DAILY`);
-        const summaryData = await summaryRes.json();
         if (summaryData && summaryData.length > 0) {
           const latest = summaryData[0];
           setDailyDeliveries(latest.daily_stopped || 0);
           setSettlementPrice(latest.settlement || null);
         }
 
-        // Fetch Firm Data
-        const noticesRes = await fetch(`/api/cme/latest-notices?metal=${metal}`);
-        const noticesData = await noticesRes.json();
         if (noticesData && noticesData.length > 0) {
           // Filter out vault operators if they accidentally appear
           const vaultOperators = ["BRINK'S", "HSBC", "JP MORGAN CHASE", "MANFRA", "MALCA-AMIT", "DELAWARE DEPOSITORY"];
