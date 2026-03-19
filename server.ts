@@ -64,6 +64,14 @@ function loadEnvFile(filePath: string): string[] {
   return loaded;
 }
 
+// Raw file diagnostics — print size, encoding hint, and first 200 bytes as hex
+if (fs.existsSync(envFilePath)) {
+  const raw = fs.readFileSync(envFilePath);
+  console.log(`[env] File size   : ${raw.length} bytes`);
+  console.log(`[env] First bytes : ${raw.slice(0, 32).toString('hex')}`);
+  console.log(`[env] Raw text    : ${JSON.stringify(raw.slice(0, 120).toString('utf8'))}`);
+}
+
 const parsedKeys = loadEnvFile(envFilePath);
 console.log(`[env] Parsed keys : ${parsedKeys.length > 0 ? parsedKeys.join(', ') : '(none)'}`);
 
