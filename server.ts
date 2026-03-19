@@ -11,15 +11,52 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse');
 
-// Load .env.local before anything reads process.env
-dotenv.config({ path: ".env.local" });
-
-const { Pool } = pg;
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Validate required environment variables at startup
+// ── Logging setup ─────────────────────────────────────────────────────────────
+const LOGS_DIR = path.join(__dirname, "logs");
+if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
+
+const BACKEND_LOG = path.join(LOGS_DIR, "backend.log");
+const FRONTEND_LOG = path.join(LOGS_DIR, "frontend.log");
+
+function writeLog(file: string, level: string, msg: string) {
+  const line = `[${new Date().toISOString()}] [${level}] ${msg}\n`;
+  fs.appendFileSync(file, line);
+}
+
+// Wrap console methods so every log also goes to logs/backend.log
+const _log   = console.log.bind(console);
+const _warn  = console.warn.bind(console);
+const _error = console.error.bind(console);
+console.log   = (...a) => { const m = a.map(String).join(' '); writeLog(BACKEND_LOG, 'INFO',  m); _log(...a); };
+console.warn  = (...a) => { const m = a.map(String).join(' '); writeLog(BACKEND_LOG, 'WARN',  m); _warn(...a); };
+console.error = (...a) => { const m = a.map(String).join(' '); writeLog(BACKEND_LOG, 'ERROR', m); _error(...a); };
+
+// ── Load .env.local ───────────────────────────────────────────────────────────
+// Use absolute path — relative paths depend on CWD which can vary by launch method.
+// override:true ensures vars are written even if the shell already exported stale values.
+const envFilePath = path.join(__dirname, ".env.local");
+console.log(`[env] Loading from: ${envFilePath}`);
+console.log(`[env] File exists : ${fs.existsSync(envFilePath)}`);
+
+const dotenvResult = dotenv.config({ path: envFilePath, override: true });
+if (dotenvResult.error) {
+  console.error(`[env] dotenv error: ${dotenvResult.error.message}`);
+} else {
+  const keys = Object.keys(dotenvResult.parsed || {});
+  console.log(`[env] Parsed keys : ${keys.length > 0 ? keys.join(', ') : '(none)'}`);
+}
+
+// ── Env var validation ────────────────────────────────────────────────────────
+console.log(`[env] PGHOST     = ${process.env.PGHOST     ?? '(unset)'}`);
+console.log(`[env] PGPORT     = ${process.env.PGPORT     ?? '(unset)'}`);
+console.log(`[env] PGDATABASE = ${process.env.PGDATABASE ?? '(unset)'}`);
+console.log(`[env] PGUSER     = ${process.env.PGUSER     ?? '(unset)'}`);
+console.log(`[env] PGPASSWORD = ${process.env.PGPASSWORD ? '(set)'   : '(unset)'}`);
+console.log(`[env] PGSSLMODE  = ${process.env.PGSSLMODE  ?? '(unset)'}`);
+
 const requiredEnvVars = ['PGHOST', 'PGDATABASE', 'PGUSER', 'PGPASSWORD'];
 const missingEnvVars = requiredEnvVars.filter(v => !process.env[v]);
 if (missingEnvVars.length > 0) {
@@ -27,6 +64,8 @@ if (missingEnvVars.length > 0) {
   console.error('Set them in .env.local: PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, PGSSLMODE');
   process.exit(1);
 }
+
+const { Pool } = pg;
 
 // Data retention window
 const RETENTION_DAYS = 90;
@@ -701,6 +740,14 @@ async function startServer() {
   });
 
   // 6. Get Inventory History (Alias for latest-stocks)
+  // Frontend log receiver — writes to logs/frontend.log
+  app.post("/api/log", (req, res) => {
+    const { level = 'INFO', message = '', data } = req.body || {};
+    const extra = data ? ` | ${JSON.stringify(data)}` : '';
+    writeLog(FRONTEND_LOG, String(level).toUpperCase(), `${message}${extra}`);
+    res.sendStatus(204);
+  });
+
   app.get("/api/history", async (req, res) => {
     try {
       const metal = req.query.metal || 'GOLD';
