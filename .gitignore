@@ -1,1 +1,3 @@
 node_modules
+.env.local
+gold_data.db

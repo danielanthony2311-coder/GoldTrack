@@ -2,7 +2,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
-import Database from "better-sqlite3";
+import pg from "pg";
 import axios from "axios";
 import * as XLSX from "xlsx";
 import fs from "fs";
@@ -10,10 +10,21 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse');
 
+const { Pool } = pg;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database("gold_data.db");
+// PostgreSQL connection pool
+const sslMode = process.env.PGSSLMODE;
+const pool = new Pool({
+  host: process.env.PGHOST || 'localhost',
+  port: parseInt(process.env.PGPORT || '5432', 10),
+  database: process.env.PGDATABASE || 'postgres',
+  user: process.env.PGUSER || 'postgres',
+  password: process.env.PGPASSWORD,
+  ssl: sslMode === 'require' ? { rejectUnauthorized: false } : undefined,
+});
 
 // History file management
 const HISTORY_FILE = path.join(__dirname, "data", "inventory_history.json");
@@ -35,7 +46,7 @@ function getHistory() {
 
 function saveHistory(entry: any) {
   let history = getHistory();
-  
+
   // Update or append
   const existingIndex = history.findIndex((h: any) => h.date === entry.date);
   if (existingIndex >= 0) {
@@ -43,67 +54,77 @@ function saveHistory(entry: any) {
   } else {
     history.push(entry);
   }
-  
+
   // Sort and cap at 90
   history.sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime());
   if (history.length > 90) {
     history = history.slice(-90);
   }
-  
+
   fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
   return history;
 }
 
 // Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS warehouse_stocks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    metal TEXT NOT NULL,
-    registered_oz INTEGER NOT NULL,
-    eligible_oz INTEGER NOT NULL,
-    total_oz INTEGER NOT NULL,
-    daily_change_registered INTEGER,
-    daily_change_eligible INTEGER,
-    delta_label TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(date, metal)
-  );
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS warehouse_stocks (
+      id BIGSERIAL PRIMARY KEY,
+      date TEXT NOT NULL,
+      metal TEXT NOT NULL,
+      registered_oz BIGINT NOT NULL,
+      eligible_oz BIGINT NOT NULL,
+      total_oz BIGINT NOT NULL,
+      daily_change_registered BIGINT,
+      daily_change_eligible BIGINT,
+      delta_label TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(date, metal)
+    )
+  `);
 
-  CREATE TABLE IF NOT EXISTS vault_stocks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    vault TEXT NOT NULL,
-    metal TEXT NOT NULL,
-    registered_oz INTEGER NOT NULL,
-    eligible_oz INTEGER NOT NULL,
-    UNIQUE(date, vault, metal)
-  );
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vault_stocks (
+      id BIGSERIAL PRIMARY KEY,
+      date TEXT NOT NULL,
+      vault TEXT NOT NULL,
+      metal TEXT NOT NULL,
+      registered_oz BIGINT NOT NULL,
+      eligible_oz BIGINT NOT NULL,
+      UNIQUE(date, vault, metal)
+    )
+  `);
 
-  CREATE TABLE IF NOT EXISTS delivery_notices (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    firm TEXT NOT NULL,
-    issued INTEGER DEFAULT 0,
-    stopped INTEGER DEFAULT 0,
-    metal TEXT NOT NULL,
-    account_type TEXT NOT NULL,
-    UNIQUE(date, firm, metal, account_type)
-  );
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS delivery_notices (
+      id BIGSERIAL PRIMARY KEY,
+      date TEXT NOT NULL,
+      firm TEXT NOT NULL,
+      issued INTEGER DEFAULT 0,
+      stopped INTEGER DEFAULT 0,
+      metal TEXT NOT NULL,
+      account_type TEXT NOT NULL,
+      UNIQUE(date, firm, metal, account_type)
+    )
+  `);
 
-  CREATE TABLE IF NOT EXISTS metals_summary (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    metal TEXT NOT NULL,
-    report_type TEXT NOT NULL,
-    mtd INTEGER,
-    settlement REAL,
-    daily_issued INTEGER,
-    daily_stopped INTEGER,
-    ytd_json TEXT,
-    UNIQUE(date, metal, report_type)
-  );
-`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS metals_summary (
+      id BIGSERIAL PRIMARY KEY,
+      date TEXT NOT NULL,
+      metal TEXT NOT NULL,
+      report_type TEXT NOT NULL,
+      mtd BIGINT,
+      settlement REAL,
+      daily_issued INTEGER,
+      daily_stopped INTEGER,
+      ytd_json TEXT,
+      UNIQUE(date, metal, report_type)
+    )
+  `);
+
+  console.log("✅ Database tables ensured.");
+}
 
 function parseCMEPdf(text: string, filename: string) {
   const lines = text.split('\n');
@@ -167,16 +188,16 @@ function parseCMEPdf(text: string, filename: string) {
     }
   }
 
-  return { 
-    report_type: reportType, 
-    business_date: businessDate, 
+  return {
+    report_type: reportType,
+    business_date: businessDate,
     metals
   };
 }
 
 function processSection(lines: string[], type: string, metal: string) {
   const result: any = {};
-  
+
   if (type === "MTD") {
     let dateRows: string[] = [];
     for (const line of lines) {
@@ -218,7 +239,7 @@ function processSection(lines: string[], type: string, metal: string) {
         const firmNbr = firmMatch[1];
         const org = firmMatch[2];
         const rest = firmMatch[3];
-        
+
         // The numbers are at the end. Issued is 4th col, Stopped is 5th.
         // Pattern: [FIRM_NAME] [ISSUED] [STOPPED]
         // Some might be blank.
@@ -254,7 +275,7 @@ function processSection(lines: string[], type: string, metal: string) {
 
         // Clean firm name
         firmName = firmName.replace(/[\d,.\s]+$/, '').trim();
-        
+
         if (issued > 0 || stopped > 0) {
           if (!firmTotals[firmName]) {
             firmTotals[firmName] = { issued: 0, stopped: 0 };
@@ -310,7 +331,7 @@ async function parseXls(buffer: Buffer, metal: string) {
     const row = rawData[i];
     if (!row || row.length === 0) continue;
     const rowStr = row.join(" ").toUpperCase();
-    
+
     if (rowStr.includes("TOTAL REGISTERED")) {
       const numbers = row.filter(cell => typeof cell === 'number');
       if (numbers.length > 0) registered = Math.round(numbers[numbers.length - 1]);
@@ -328,9 +349,9 @@ async function parseXls(buffer: Buffer, metal: string) {
   const vaultData: any = {};
   // Common vaults + metal specific ones
   const vaults = [
-    "ASAHI", "BRINK'S", "DELAWARE DEPOSITORY", "HSBC BANK USA", 
-    "INTERNATIONAL DEPOSITORY SERVICES OF DELAWARE", "JP MORGAN CHASE BANK NA", 
-    "LOOMIS INTERNATIONAL", "MALCA-AMIT USA", "MANFRA TORDELLA & BROOKES", 
+    "ASAHI", "BRINK'S", "DELAWARE DEPOSITORY", "HSBC BANK USA",
+    "INTERNATIONAL DEPOSITORY SERVICES OF DELAWARE", "JP MORGAN CHASE BANK NA",
+    "LOOMIS INTERNATIONAL", "MALCA-AMIT USA", "MANFRA TORDELLA & BROOKES",
     "STONEX PRECIOUS METALS", "CNT DEPOSITORY", "MALCA-AMIT ARMORED"
   ];
 
@@ -338,7 +359,7 @@ async function parseXls(buffer: Buffer, metal: string) {
     const row = rawData[i];
     if (!row || row.length === 0) continue;
     const rowStr = row.join(" ").toUpperCase();
-    
+
     for (const vault of vaults) {
       if (rowStr.includes(vault)) {
         let vReg = 0;
@@ -373,8 +394,11 @@ async function startServer() {
 
   app.use(express.json());
 
+  // Initialize database tables
+  await initDb();
+
   // API Routes
-  
+
   // 1. Consolidated Sync from CME
   app.get("/api/cme/sync", async (req, res) => {
     const urls = {
@@ -423,51 +447,72 @@ async function startServer() {
     const processXlsData = async (data: any, metal: string) => {
       if (!data) return;
       const parsed = await parseXls(Buffer.from(data), metal);
-      
-      // Calculate deltas
-      const prevRow = db.prepare("SELECT * FROM warehouse_stocks WHERE metal = ? AND date < ? ORDER BY date DESC LIMIT 1").get(metal, parsed.reportDate);
-      let daily_change_registered = 0;
-      let daily_change_eligible = 0;
+
+      // Calculate deltas vs previous row for same metal
+      const prevResult = await pool.query(
+        "SELECT * FROM warehouse_stocks WHERE metal = $1 AND date < $2 ORDER BY date DESC LIMIT 1",
+        [metal, parsed.reportDate]
+      );
+      const prevRow = prevResult.rows[0] || null;
+
+      let daily_change_registered: number | null = 0;
+      let daily_change_eligible: number | null = 0;
       let delta_label = "24h Change";
 
       if (prevRow) {
-        daily_change_registered = parsed.registered - prevRow.registered_oz;
-        daily_change_eligible = parsed.eligible - prevRow.eligible_oz;
+        daily_change_registered = parsed.registered - Number(prevRow.registered_oz);
+        daily_change_eligible = parsed.eligible - Number(prevRow.eligible_oz);
       } else {
         daily_change_registered = null;
         daily_change_eligible = null;
         delta_label = "—";
       }
 
-      db.transaction(() => {
-        db.prepare(`
-          INSERT INTO warehouse_stocks (date, metal, registered_oz, eligible_oz, total_oz, daily_change_registered, daily_change_eligible, delta_label)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(date, metal) DO UPDATE SET
-            registered_oz = excluded.registered_oz,
-            eligible_oz = excluded.eligible_oz,
-            total_oz = excluded.total_oz,
-            daily_change_registered = excluded.daily_change_registered,
-            daily_change_eligible = excluded.daily_change_eligible,
-            delta_label = excluded.delta_label
-        `).run(parsed.reportDate, metal, parsed.registered, parsed.eligible, parsed.total, daily_change_registered, daily_change_eligible, delta_label);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
 
-        const insertVault = db.prepare(`
-          INSERT OR REPLACE INTO vault_stocks (date, vault, metal, registered_oz, eligible_oz)
-          VALUES (?, ?, ?, ?, ?)
-        `);
+        await client.query(`
+          INSERT INTO warehouse_stocks (date, metal, registered_oz, eligible_oz, total_oz, daily_change_registered, daily_change_eligible, delta_label)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          ON CONFLICT(date, metal) DO UPDATE SET
+            registered_oz = EXCLUDED.registered_oz,
+            eligible_oz = EXCLUDED.eligible_oz,
+            total_oz = EXCLUDED.total_oz,
+            daily_change_registered = EXCLUDED.daily_change_registered,
+            daily_change_eligible = EXCLUDED.daily_change_eligible,
+            delta_label = EXCLUDED.delta_label
+        `, [parsed.reportDate, metal, parsed.registered, parsed.eligible, parsed.total, daily_change_registered, daily_change_eligible, delta_label]);
+
         for (const [vault, vals] of Object.entries(parsed.vaultData)) {
           const v = vals as any;
-          insertVault.run(parsed.reportDate, vault, metal, v.registered, v.eligible);
+          await client.query(`
+            INSERT INTO vault_stocks (date, vault, metal, registered_oz, eligible_oz)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT(date, vault, metal) DO UPDATE SET
+              registered_oz = EXCLUDED.registered_oz,
+              eligible_oz = EXCLUDED.eligible_oz
+          `, [parsed.reportDate, vault, metal, v.registered, v.eligible]);
         }
 
         // Cleanup: Keep only last 90 days per metal
-        const oldestDate = db.prepare("SELECT date FROM warehouse_stocks WHERE metal = ? ORDER BY date DESC LIMIT 1 OFFSET 89").get(metal);
-        if (oldestDate) {
-          db.prepare("DELETE FROM warehouse_stocks WHERE metal = ? AND date < ?").run(metal, oldestDate.date);
-          db.prepare("DELETE FROM vault_stocks WHERE metal = ? AND date < ?").run(metal, oldestDate.date);
+        const oldestResult = await client.query(
+          "SELECT date FROM warehouse_stocks WHERE metal = $1 ORDER BY date DESC LIMIT 1 OFFSET 89",
+          [metal]
+        );
+        if (oldestResult.rows[0]) {
+          const oldestDate = oldestResult.rows[0].date;
+          await client.query("DELETE FROM warehouse_stocks WHERE metal = $1 AND date < $2", [metal, oldestDate]);
+          await client.query("DELETE FROM vault_stocks WHERE metal = $1 AND date < $2", [metal, oldestDate]);
         }
-      })();
+
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
     };
 
     await processXlsData(goldXlsData, 'GOLD');
@@ -481,46 +526,52 @@ async function startServer() {
       const reportDate = parsedData.business_date;
       if (!reportDate) return;
 
-      db.transaction(() => {
-        const upsertSummary = db.prepare(`
-          INSERT INTO metals_summary (date, metal, report_type, mtd, settlement, daily_issued, daily_stopped, ytd_json)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(date, metal, report_type) DO UPDATE SET
-            mtd = excluded.mtd,
-            settlement = excluded.settlement,
-            daily_issued = excluded.daily_issued,
-            daily_stopped = excluded.daily_stopped,
-            ytd_json = excluded.ytd_json
-        `);
-
-        const upsertFirm = db.prepare(`
-          INSERT INTO delivery_notices (date, firm, issued, stopped, metal, account_type)
-          VALUES (?, ?, ?, ?, ?, ?)
-          ON CONFLICT(date, firm, metal, account_type) DO UPDATE SET
-            issued = excluded.issued,
-            stopped = excluded.stopped
-        `);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
 
         for (const [metal, details] of Object.entries(parsedData.metals)) {
           const d = details as any;
-          upsertSummary.run(
-            reportDate, 
-            metal, 
-            parsedData.report_type, 
-            d.mtd || null, 
-            d.settlement || null, 
-            d.daily_issued || null, 
-            d.daily_stopped || null, 
+          await client.query(`
+            INSERT INTO metals_summary (date, metal, report_type, mtd, settlement, daily_issued, daily_stopped, ytd_json)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT(date, metal, report_type) DO UPDATE SET
+              mtd = EXCLUDED.mtd,
+              settlement = EXCLUDED.settlement,
+              daily_issued = EXCLUDED.daily_issued,
+              daily_stopped = EXCLUDED.daily_stopped,
+              ytd_json = EXCLUDED.ytd_json
+          `, [
+            reportDate,
+            metal,
+            parsedData.report_type,
+            d.mtd || null,
+            d.settlement || null,
+            d.daily_issued || null,
+            d.daily_stopped || null,
             d.ytd_by_month ? JSON.stringify(d.ytd_by_month) : null
-          );
+          ]);
 
           if (parsedData.report_type === "DAILY" && d.all_firms) {
             for (const firm of d.all_firms) {
-              upsertFirm.run(reportDate, firm.firm, firm.issued, firm.stopped, metal, firm.org === "C" ? "CUSTOMER" : "HOUSE");
+              await client.query(`
+                INSERT INTO delivery_notices (date, firm, issued, stopped, metal, account_type)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT(date, firm, metal, account_type) DO UPDATE SET
+                  issued = EXCLUDED.issued,
+                  stopped = EXCLUDED.stopped
+              `, [reportDate, firm.firm, firm.issued, firm.stopped, metal, firm.org === "C" ? "CUSTOMER" : "HOUSE"]);
             }
           }
         }
-      })();
+
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
     };
 
     await processPdfData(mtdPdfData, "MetalsIssuesAndStopsMTDReport.pdf");
@@ -534,80 +585,107 @@ async function startServer() {
   });
 
   // 5. Get Metals Summary
-  app.get("/api/cme/summary", (req, res) => {
+  app.get("/api/cme/summary", async (req, res) => {
     try {
       const { metal, type } = req.query;
       let query = "SELECT * FROM metals_summary WHERE 1=1";
       const params: any[] = [];
-      
+      let paramIdx = 1;
+
       if (metal) {
-        query += " AND metal = ?";
+        query += ` AND metal = $${paramIdx++}`;
         params.push(metal);
       }
       if (type) {
-        query += " AND report_type = ?";
+        query += ` AND report_type = $${paramIdx++}`;
         params.push(type);
       }
-      
+
       query += " ORDER BY date DESC LIMIT 50";
-      const rows = db.prepare(query).all(...params);
-      
+      const result = await pool.query(query, params);
+
       // Parse YTD JSON
-      const result = rows.map(row => ({
+      const rows = result.rows.map((row: any) => ({
         ...row,
         ytd_by_month: row.ytd_json ? JSON.parse(row.ytd_json) : null
       }));
-      
-      res.json(result);
+
+      res.json(rows);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   });
 
   // 4. Get Latest Delivery Notices
-  app.get("/api/cme/latest-notices", (req, res) => {
+  app.get("/api/cme/latest-notices", async (req, res) => {
     try {
       const metal = req.query.metal || 'GOLD';
-      const date = req.query.date || db.prepare("SELECT date FROM delivery_notices WHERE metal = ? ORDER BY date DESC LIMIT 1").get(metal)?.date;
+      let date = req.query.date as string | undefined;
+      if (!date) {
+        const dateResult = await pool.query(
+          "SELECT date FROM delivery_notices WHERE metal = $1 ORDER BY date DESC LIMIT 1",
+          [metal]
+        );
+        date = dateResult.rows[0]?.date;
+      }
       if (!date) return res.json([]);
-      
-      const rows = db.prepare("SELECT * FROM delivery_notices WHERE date = ? AND metal = ? ORDER BY stopped DESC, issued DESC").all(date, metal);
-      res.json(rows);
+
+      const result = await pool.query(
+        "SELECT * FROM delivery_notices WHERE date = $1 AND metal = $2 ORDER BY stopped DESC, issued DESC",
+        [date, metal]
+      );
+      res.json(result.rows);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   });
 
   // 2. Get Latest Stocks (History)
-  app.get("/api/cme/latest-stocks", (req, res) => {
+  app.get("/api/cme/latest-stocks", async (req, res) => {
     try {
       const metal = req.query.metal || 'GOLD';
-      const rows = db.prepare("SELECT * FROM warehouse_stocks WHERE metal = ? ORDER BY date ASC").all(metal);
-      res.json(rows);
+      const result = await pool.query(
+        "SELECT * FROM warehouse_stocks WHERE metal = $1 ORDER BY date ASC",
+        [metal]
+      );
+      res.json(result.rows);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   });
 
   // 6. Get Inventory History (Alias for latest-stocks)
-  app.get("/api/history", (req, res) => {
+  app.get("/api/history", async (req, res) => {
     try {
       const metal = req.query.metal || 'GOLD';
-      const rows = db.prepare("SELECT * FROM warehouse_stocks WHERE metal = ? ORDER BY date ASC").all(metal);
-      res.json(rows);
+      const result = await pool.query(
+        "SELECT * FROM warehouse_stocks WHERE metal = $1 ORDER BY date ASC",
+        [metal]
+      );
+      res.json(result.rows);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   });
 
   // 7. Get Vault Breakdown
-  app.get("/api/cme/vault-breakdown", (req, res) => {
+  app.get("/api/cme/vault-breakdown", async (req, res) => {
     try {
       const metal = req.query.metal || 'GOLD';
-      const date = req.query.date || db.prepare("SELECT date FROM vault_stocks WHERE metal = ? ORDER BY date DESC LIMIT 1").get(metal)?.date;
+      let date = req.query.date as string | undefined;
+      if (!date) {
+        const dateResult = await pool.query(
+          "SELECT date FROM vault_stocks WHERE metal = $1 ORDER BY date DESC LIMIT 1",
+          [metal]
+        );
+        date = dateResult.rows[0]?.date;
+      }
       if (!date) return res.json([]);
-      const rows = db.prepare("SELECT * FROM vault_stocks WHERE date = ? AND metal = ? ORDER BY (registered_oz + eligible_oz) DESC").all(date, metal);
-      res.json(rows);
+      const result = await pool.query(
+        "SELECT * FROM vault_stocks WHERE date = $1 AND metal = $2 ORDER BY (registered_oz + eligible_oz) DESC",
+        [date, metal]
+      );
+      res.json(result.rows);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -628,17 +706,19 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  app.listen(PORT, "0.0.0.0", async () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    
+
     // BUG 4: Restore lost March 16 data
     try {
-      const exists = db.prepare("SELECT * FROM warehouse_stocks WHERE date = '2026-03-16' AND metal = 'GOLD'").get();
-      if (!exists) {
-        db.prepare(`
+      const existsResult = await pool.query(
+        "SELECT 1 FROM warehouse_stocks WHERE date = '2026-03-16' AND metal = 'GOLD'"
+      );
+      if (existsResult.rows.length === 0) {
+        await pool.query(`
           INSERT INTO warehouse_stocks (date, metal, registered_oz, eligible_oz, total_oz, daily_change_registered, daily_change_eligible, created_at)
           VALUES ('2026-03-16', 'GOLD', 16695520, 15856042, 32551562, 0, 0, '2026-03-16 14:28:34')
-        `).run();
+        `);
         console.log("✅ Restored March 16 data point.");
       }
     } catch (e) {
