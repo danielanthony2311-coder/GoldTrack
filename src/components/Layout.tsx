@@ -76,7 +76,7 @@ export default function Layout({ children }: LayoutProps) {
 
       {/* Main Content */}
       <main className="flex-1 flex flex-col min-w-0">
-        <header className="h-16 border-bottom border-zinc-800 flex items-center justify-between px-6 lg:px-8">
+        <header className="h-16 border-b border-zinc-800 flex items-center justify-between px-6 lg:px-8">
           <button 
             className="lg:hidden p-2 text-zinc-400"
             onClick={() => setIsSidebarOpen(true)}

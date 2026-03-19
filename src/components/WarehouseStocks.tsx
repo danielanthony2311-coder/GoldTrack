@@ -32,16 +32,16 @@ export default function WarehouseStocks() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [showDebug, setShowDebug] = useState(false);
 
-  const fetchData = async () => {
+  const fetchData = async (signal?: AbortSignal) => {
     try {
       // Fetch history (which now includes all rows from DB)
-      const response = await fetch(`/api/history?metal=${metal}`);
+      const response = await fetch(`/api/history?metal=${metal}`, { signal });
       if (!response.ok) throw new Error(`History API error! status: ${response.status}`);
 
       const history = await response.json();
-      
+
       if (!Array.isArray(history)) throw new Error('History data is not an array');
-      
+
       const formattedData = history.map((h: any) => ({
         date: h.date,
         registered_oz: h.registered_oz,
@@ -51,18 +51,19 @@ export default function WarehouseStocks() {
         daily_change_eligible: h.daily_change_eligible,
         delta_label: h.delta_label
       }));
-      
+
       setData(formattedData);
       setLastUpdated(new Date());
       setError(null);
 
       // Fetch vault breakdown
-      const vaultRes = await fetch(`/api/cme/vault-breakdown?metal=${metal}`);
+      const vaultRes = await fetch(`/api/cme/vault-breakdown?metal=${metal}`, { signal });
       if (vaultRes.ok) {
         const vaults = await vaultRes.json();
         setVaultData(vaults);
       }
     } catch (err: any) {
+      if (err.name === 'AbortError') return;
       console.error(err);
       setError(err.message || 'Failed to fetch warehouse stocks');
     } finally {
@@ -93,9 +94,13 @@ export default function WarehouseStocks() {
   };
 
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 5 * 60 * 1000); // 5 minutes
-    return () => clearInterval(interval);
+    const controller = new AbortController();
+    fetchData(controller.signal);
+    const interval = setInterval(() => fetchData(controller.signal), 5 * 60 * 1000); // 5 minutes
+    return () => {
+      controller.abort();
+      clearInterval(interval);
+    };
   }, [metal]);
 
   if (loading && data.length === 0) {

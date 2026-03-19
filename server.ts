@@ -15,14 +15,28 @@ const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Validate required environment variables at startup
+const requiredEnvVars = ['PGHOST', 'PGDATABASE', 'PGUSER', 'PGPASSWORD'];
+const missingEnvVars = requiredEnvVars.filter(v => !process.env[v]);
+if (missingEnvVars.length > 0) {
+  console.error(`❌ Missing required environment variables: ${missingEnvVars.join(', ')}`);
+  console.error('Set them in .env.local: PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, PGSSLMODE');
+  process.exit(1);
+}
+
+// Data retention window
+const RETENTION_DAYS = 90;
+
 // PostgreSQL connection pool
 const sslMode = process.env.PGSSLMODE;
 const pool = new Pool({
-  host: process.env.PGHOST || 'localhost',
+  host: process.env.PGHOST,
   port: parseInt(process.env.PGPORT || '5432', 10),
-  database: process.env.PGDATABASE || 'postgres',
-  user: process.env.PGUSER || 'postgres',
+  database: process.env.PGDATABASE,
+  user: process.env.PGUSER,
   password: process.env.PGPASSWORD,
+  // NOTE: rejectUnauthorized: false skips TLS certificate validation.
+  // For production, replace with ssl: { ca: fs.readFileSync('ca.pem') }.
   ssl: sslMode === 'require' ? { rejectUnauthorized: false } : undefined,
 });
 
@@ -123,7 +137,13 @@ async function initDb() {
     )
   `);
 
-  console.log("✅ Database tables ensured.");
+  // Indexes for common filter patterns
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_warehouse_metal_date ON warehouse_stocks(metal, date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_vault_metal_date ON vault_stocks(metal, date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_notices_metal_date ON delivery_notices(metal, date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_summary_metal_date ON metals_summary(metal, date DESC)`);
+
+  console.log("✅ Database tables and indexes ensured.");
 }
 
 function parseCMEPdf(text: string, filename: string) {
@@ -210,11 +230,12 @@ function processSection(lines: string[], type: string, metal: string) {
       const lastDateLine = dateRows[dateRows.length - 1];
       const parts = lastDateLine.split(/\s+/);
       if (parts.length >= 3) {
-        const daily = parseInt(parts[1].replace(/,/g, '')) || 0;
-        const cumulative = parseInt(parts[2].replace(/,/g, '')) || 0;
+        const dailyRaw = parseInt(parts[1].replace(/,/g, ''), 10);
+        const cumulativeRaw = parseInt(parts[2].replace(/,/g, ''), 10);
+        const daily = isNaN(dailyRaw) ? 0 : dailyRaw;
+        const cumulative = isNaN(cumulativeRaw) ? 0 : cumulativeRaw;
         result.mtd = cumulative;
         result.daily_stopped = daily;
-        console.log(`[DEBUG] MTD ${metal}: daily=${daily}, cumulative=${cumulative} from line: ${lastDateLine}`);
       }
     }
   } else if (type === "DAILY") {
@@ -248,9 +269,10 @@ function processSection(lines: string[], type: string, metal: string) {
         let issued = 0;
         let stopped = 0;
 
+        const safeInt = (s: string) => { const n = parseInt(s.replace(/,/g, ''), 10); return isNaN(n) ? 0 : n; };
         if (parts.length === 3) {
-          issued = parseInt(parts[1].replace(/,/g, '')) || 0;
-          stopped = parseInt(parts[2].replace(/,/g, '')) || 0;
+          issued = safeInt(parts[1]);
+          stopped = safeInt(parts[2]);
         } else if (parts.length === 2) {
           // Check position to see if it's issued or stopped
           // This is tricky without fixed width. Let's try a different approach.
@@ -260,14 +282,14 @@ function processSection(lines: string[], type: string, metal: string) {
             const num2 = numbersMatch[2];
             const pos1 = rest.lastIndexOf(num1);
             if (num2) {
-              issued = parseInt(num1.replace(/,/g, '')) || 0;
-              stopped = parseInt(num2.replace(/,/g, '')) || 0;
+              issued = safeInt(num1);
+              stopped = safeInt(num2);
             } else {
               // If only one number, check its relative position in the line
               if (pos1 > 40) { // Arbitrary threshold for "Stopped" column
-                stopped = parseInt(num1.replace(/,/g, '')) || 0;
+                stopped = safeInt(num1);
               } else {
-                issued = parseInt(num1.replace(/,/g, '')) || 0;
+                issued = safeInt(num1);
               }
             }
           }
@@ -289,8 +311,10 @@ function processSection(lines: string[], type: string, metal: string) {
         const parts = line.trim().split(/\s+/);
         const totalIdx = parts.findIndex(p => p.includes("TOTAL:"));
         if (totalIdx !== -1) {
-          result.daily_issued = parseInt(parts[totalIdx + 1]?.replace(/,/g, '')) || 0;
-          result.daily_stopped = parseInt(parts[totalIdx + 2]?.replace(/,/g, '')) || 0;
+          const issuedRaw = parseInt(parts[totalIdx + 1]?.replace(/,/g, ''), 10);
+          const stoppedRaw = parseInt(parts[totalIdx + 2]?.replace(/,/g, ''), 10);
+          result.daily_issued = isNaN(issuedRaw) ? 0 : issuedRaw;
+          result.daily_stopped = isNaN(stoppedRaw) ? 0 : stoppedRaw;
         }
       }
     }
@@ -495,9 +519,9 @@ async function startServer() {
           `, [parsed.reportDate, vault, metal, v.registered, v.eligible]);
         }
 
-        // Cleanup: Keep only last 90 days per metal
+        // Cleanup: Keep only last RETENTION_DAYS days per metal
         const oldestResult = await client.query(
-          "SELECT date FROM warehouse_stocks WHERE metal = $1 ORDER BY date DESC LIMIT 1 OFFSET 89",
+          `SELECT date FROM warehouse_stocks WHERE metal = $1 ORDER BY date DESC LIMIT 1 OFFSET ${RETENTION_DAYS - 1}`,
           [metal]
         );
         if (oldestResult.rows[0]) {
@@ -515,8 +539,14 @@ async function startServer() {
       }
     };
 
-    await processXlsData(goldXlsData, 'GOLD');
-    await processXlsData(silverXlsData, 'SILVER');
+    for (const [xlsData, metal] of [[goldXlsData, 'GOLD'], [silverXlsData, 'SILVER']] as const) {
+      try {
+        await processXlsData(xlsData, metal);
+      } catch (e: any) {
+        console.error(`❌ Failed to process ${metal} XLS:`, e.message);
+        results.errors.push({ file: `${metal.toLowerCase()}Xls`, message: e.message });
+      }
+    }
 
     // Process PDF Files
     const processPdfData = async (data: any, filename: string) => {
@@ -524,7 +554,10 @@ async function startServer() {
       const pdfData = await pdfParser(Buffer.from(data));
       const parsedData = parseCMEPdf(pdfData.text, filename);
       const reportDate = parsedData.business_date;
-      if (!reportDate) return;
+      if (!reportDate) {
+        console.warn(`⚠️ No business date found in ${filename} — skipping DB write`);
+        return;
+      }
 
       const client = await pool.connect();
       try {
@@ -574,8 +607,14 @@ async function startServer() {
       }
     };
 
-    await processPdfData(mtdPdfData, "MetalsIssuesAndStopsMTDReport.pdf");
-    await processPdfData(dailyPdfData, "MetalsIssuesAndStopsReport.pdf");
+    for (const [pdfData, filename] of [[mtdPdfData, "MetalsIssuesAndStopsMTDReport.pdf"], [dailyPdfData, "MetalsIssuesAndStopsReport.pdf"]] as const) {
+      try {
+        await processPdfData(pdfData, filename);
+      } catch (e: any) {
+        console.error(`❌ Failed to process ${filename}:`, e.message);
+        results.errors.push({ file: filename, message: e.message });
+      }
+    }
 
     if (results.errors.length > 0) {
       results.success = false;
@@ -604,11 +643,14 @@ async function startServer() {
       query += " ORDER BY date DESC LIMIT 50";
       const result = await pool.query(query, params);
 
-      // Parse YTD JSON
-      const rows = result.rows.map((row: any) => ({
-        ...row,
-        ytd_by_month: row.ytd_json ? JSON.parse(row.ytd_json) : null
-      }));
+      // Parse YTD JSON (guard against corrupted column data)
+      const rows = result.rows.map((row: any) => {
+        let ytd_by_month = null;
+        if (row.ytd_json) {
+          try { ytd_by_month = JSON.parse(row.ytd_json); } catch { /* ignore corrupt rows */ }
+        }
+        return { ...row, ytd_by_month };
+      });
 
       res.json(rows);
     } catch (error: any) {
