@@ -1,0 +1,5 @@
+{
+  "name": "BullionTrack: Gold Market Dashboard",
+  "description": "A comprehensive gold market tracking dashboard featuring COMEX delivery rates, warehouse stocks, and central bank purchase analytics.",
+  "requestFramePermissions": []
+}

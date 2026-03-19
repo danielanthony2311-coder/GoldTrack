@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  
+  --color-gold-50: #fffbeb;
+  --color-gold-100: #fef3c7;
+  --color-gold-200: #fde68a;
+  --color-gold-300: #fcd34d;
+  --color-gold-400: #fbbf24;
+  --color-gold-500: #F39C12;
+  --color-gold-600: #B8860B;
+  --color-gold-700: #996515;
+  --color-gold-800: #8B4513;
+  --color-gold-900: #5C4033;
+}
+
+@layer base {
+  body {
+    @apply bg-[#0B0E11] text-zinc-100 antialiased;
+  }
+}
+
+.glass-card {
+  @apply bg-zinc-900/50 border border-zinc-800 backdrop-blur-md rounded-2xl;
+}
+
+.chart-tooltip {
+  @apply bg-zinc-900 border border-zinc-800 p-3 rounded-lg shadow-xl text-sm;
+}
+
