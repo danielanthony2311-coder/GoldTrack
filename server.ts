@@ -2,7 +2,6 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
-import dotenv from "dotenv";
 import pg from "pg";
 import axios from "axios";
 import * as XLSX from "xlsx";
@@ -35,19 +34,38 @@ console.warn  = (...a) => { const m = a.map(String).join(' '); writeLog(BACKEND_
 console.error = (...a) => { const m = a.map(String).join(' '); writeLog(BACKEND_LOG, 'ERROR', m); _error(...a); };
 
 // ── Load .env.local ───────────────────────────────────────────────────────────
-// Use absolute path — relative paths depend on CWD which can vary by launch method.
-// override:true ensures vars are written even if the shell already exported stale values.
+// We parse the file manually rather than relying on dotenv to avoid encoding
+// issues (BOM, CRLF, dotenv version quirks) that cause zero vars to be loaded.
 const envFilePath = path.join(__dirname, ".env.local");
 console.log(`[env] Loading from: ${envFilePath}`);
 console.log(`[env] File exists : ${fs.existsSync(envFilePath)}`);
 
-const dotenvResult = dotenv.config({ path: envFilePath, override: true });
-if (dotenvResult.error) {
-  console.error(`[env] dotenv error: ${dotenvResult.error.message}`);
-} else {
-  const keys = Object.keys(dotenvResult.parsed || {});
-  console.log(`[env] Parsed keys : ${keys.length > 0 ? keys.join(', ') : '(none)'}`);
+function loadEnvFile(filePath: string): string[] {
+  if (!fs.existsSync(filePath)) return [];
+  const raw = fs.readFileSync(filePath, 'utf8');
+  // Strip UTF-8 BOM if present, normalise line endings
+  const content = raw.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const loaded: string[] = [];
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    let value = trimmed.slice(eqIdx + 1).trim();
+    // Strip surrounding quotes (single or double)
+    if (value.length >= 2 &&
+        ((value.startsWith('"') && value.endsWith('"')) ||
+         (value.startsWith("'") && value.endsWith("'")))) {
+      value = value.slice(1, -1);
+    }
+    if (key) { process.env[key] = value; loaded.push(key); }
+  }
+  return loaded;
 }
+
+const parsedKeys = loadEnvFile(envFilePath);
+console.log(`[env] Parsed keys : ${parsedKeys.length > 0 ? parsedKeys.join(', ') : '(none)'}`);
 
 // ── Env var validation ────────────────────────────────────────────────────────
 console.log(`[env] PGHOST     = ${process.env.PGHOST     ?? '(unset)'}`);
