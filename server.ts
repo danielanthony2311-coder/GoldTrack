@@ -8,7 +8,13 @@ import * as XLSX from "xlsx";
 import fs from "fs";
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-const pdfParse = require('pdf-parse');
+// pdf-parse is a CJS module; unwrap .default if the CJS shim wraps it
+const _pdfParseRaw = require('pdf-parse');
+const pdfParse: (buf: Buffer) => Promise<{ text: string }> =
+  typeof _pdfParseRaw === 'function' ? _pdfParseRaw
+  : typeof _pdfParseRaw?.default === 'function' ? _pdfParseRaw.default
+  : typeof _pdfParseRaw?.parse === 'function' ? _pdfParseRaw.parse
+  : null;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -534,7 +540,11 @@ async function startServer() {
       fetchFile('dailyPdf', urls.dailyPdf, 'arraybuffer')
     ]);
 
-    const pdfParser = typeof pdfParse === 'function' ? pdfParse : pdfParse.default;
+    if (!pdfParse) {
+      results.errors.push({ file: 'pdf-parse', message: 'pdf-parse module failed to load — check npm install' });
+      results.success = false;
+      return res.json(results);
+    }
 
     // Process XLS Files
     const processXlsData = async (data: any, metal: string) => {
@@ -620,7 +630,7 @@ async function startServer() {
     // Process PDF Files
     const processPdfData = async (data: any, filename: string) => {
       if (!data) return;
-      const pdfData = await pdfParser(Buffer.from(data));
+      const pdfData = await pdfParse(Buffer.from(data));
       const parsedData = parseCMEPdf(pdfData.text, filename);
       const reportDate = parsedData.business_date;
       if (!reportDate) {
@@ -813,7 +823,12 @@ async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        // Tell the browser-side HMR client to connect back on the same port
+        // as the Express server (3000), not Vite's default fallback (8081).
+        hmr: { clientPort: PORT },
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
