@@ -79,14 +79,14 @@ export default function ComexDetails() {
     try {
       const response = await fetch('/api/cme/sync');
       const syncResult = await response.json();
-      if (!response.ok || !syncResult.success) {
-        const detail = syncResult.errors?.length
-          ? syncResult.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n')
-          : 'Sync failed';
-        throw new Error(detail);
-      }
-      
+      // Always refresh — partial syncs (e.g. silver 403) still write gold data
       await fetchData();
+
+      if (!response.ok) throw new Error('Sync request failed');
+      if (syncResult.errors?.length) {
+        const detail = syncResult.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n');
+        setError(`Partial sync — some files failed:\n${detail}`);
+      }
       setRefreshKey(prev => prev + 1);
     } catch (err: any) {
       console.error(err);
