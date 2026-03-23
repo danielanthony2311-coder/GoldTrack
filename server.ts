@@ -10,6 +10,10 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 // pdf-parse is a CJS module; unwrap .default if the CJS shim wraps it
 const _pdfParseRaw = require('pdf-parse');
+// multer is a CJS module for multipart/form-data file uploads
+const _multerRaw = require('multer');
+const multer = (typeof _multerRaw === 'function' ? _multerRaw : _multerRaw?.default ?? _multerRaw) as any;
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 const pdfParse: (buf: Buffer) => Promise<{ text: string }> =
   typeof _pdfParseRaw === 'function' ? _pdfParseRaw
   : typeof _pdfParseRaw?.default === 'function' ? _pdfParseRaw.default
@@ -212,11 +216,65 @@ async function initDb() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS institutional_activity (
+      id SERIAL PRIMARY KEY,
+      report_date TEXT NOT NULL,
+      month INTEGER NOT NULL,
+      year INTEGER NOT NULL,
+      firm_code TEXT NOT NULL,
+      firm_name TEXT NOT NULL,
+      metal TEXT NOT NULL DEFAULT 'GOLD',
+      customer_issued INTEGER DEFAULT 0,
+      house_issued INTEGER DEFAULT 0,
+      total_issued INTEGER DEFAULT 0,
+      customer_stopped INTEGER DEFAULT 0,
+      house_stopped INTEGER DEFAULT 0,
+      total_stopped INTEGER DEFAULT 0,
+      net_position INTEGER DEFAULT 0,
+      is_net_buyer BOOLEAN DEFAULT false,
+      source TEXT DEFAULT 'CME YTD Report',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(report_date, month, year, firm_code, metal)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS institutional_daily_summary (
+      id SERIAL PRIMARY KEY,
+      report_date TEXT NOT NULL,
+      month INTEGER NOT NULL,
+      year INTEGER NOT NULL,
+      metal TEXT NOT NULL DEFAULT 'GOLD',
+      total_contracts INTEGER NOT NULL DEFAULT 0,
+      total_issued INTEGER NOT NULL DEFAULT 0,
+      total_stopped INTEGER NOT NULL DEFAULT 0,
+      net_market_position INTEGER NOT NULL DEFAULT 0,
+      firms_count INTEGER NOT NULL DEFAULT 0,
+      net_buyers_count INTEGER NOT NULL DEFAULT 0,
+      net_sellers_count INTEGER NOT NULL DEFAULT 0,
+      customer_issued_pct NUMERIC(5,2),
+      house_issued_pct NUMERIC(5,2),
+      customer_stopped_pct NUMERIC(5,2),
+      house_stopped_pct NUMERIC(5,2),
+      top_buyers JSONB,
+      top_sellers JSONB,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(report_date, metal)
+    )
+  `);
+
   // Indexes for common filter patterns
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_warehouse_metal_date ON warehouse_stocks(metal, date DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_vault_metal_date ON vault_stocks(metal, date DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_notices_metal_date ON delivery_notices(metal, date DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_summary_metal_date ON metals_summary(metal, date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_institutional_date ON institutional_activity(report_date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_institutional_firm ON institutional_activity(firm_name, report_date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_institutional_net ON institutional_activity(net_position DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_institutional_month_year ON institutional_activity(year DESC, month DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_daily_summary_date ON institutional_daily_summary(report_date DESC)`);
 
   console.log("✅ Database tables and indexes ensured.");
 }
@@ -401,6 +459,100 @@ function processSection(lines: string[], type: string, metal: string) {
   }
 
   return result;
+}
+
+function parseInstitutionalPdf(text: string) {
+  const MONTH_NAMES = ['JANUARY','FEBRUARY','MARCH','APRIL','MAY','JUNE','JULY','AUGUST','SEPTEMBER','OCTOBER','NOVEMBER','DECEMBER'];
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+  let metal = 'GOLD';
+  if (text.toUpperCase().includes('SILVER') && !text.toUpperCase().includes('GOLD')) metal = 'SILVER';
+
+  let reportDate = '';
+  let month = 0;
+  let year = 0;
+
+  for (const line of lines) {
+    if (line.toUpperCase().includes('BUSINESS DATE:')) {
+      const match = line.match(/(\d{1,2}\/\d{1,2}\/\d{4})/);
+      if (match) {
+        const [m, d, y] = match[1].split('/');
+        reportDate = `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+        month = parseInt(m, 10);
+        year = parseInt(y, 10);
+      }
+    }
+    if (!month) {
+      const headerMatch = line.match(/(\w+)\s+(\d{4})\s*$/);
+      if (headerMatch && line.toUpperCase().includes('FUTURES')) {
+        const mIdx = MONTH_NAMES.indexOf(headerMatch[1].toUpperCase());
+        if (mIdx >= 0) {
+          month = mIdx + 1;
+          year = parseInt(headerMatch[2], 10);
+          if (!reportDate) {
+            const today = new Date();
+            if (year === today.getFullYear() && month === today.getMonth() + 1) {
+              reportDate = today.toISOString().split('T')[0];
+            } else {
+              const lastDay = new Date(year, month, 0).getDate();
+              reportDate = `${year}-${String(month).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const parseFirmRow = (line: string): { code: string; name: string; customer: number; house: number } | null => {
+    const safeInt = (s: string) => { const n = parseInt((s || '').replace(/,/g,''), 10); return isNaN(n) ? 0 : n; };
+    // Pipe-separated: "661 | JP MORGAN SECURITIES | 12,100 | 0 | 12,100"
+    if (line.includes('|')) {
+      const parts = line.split('|').map(p => p.trim());
+      const code = parts[0]?.match(/^(\d{3})/)?.[1];
+      if (!code || parts.length < 4) return null;
+      return { code, name: parts[1], customer: safeInt(parts[2]), house: safeInt(parts[3]) };
+    }
+    // Space-separated fixed-width: "661  JP MORGAN SECURITIES  12,100  0  12,100"
+    const match = line.match(/^(\d{3})\s{1,4}(.+?)\s{2,}([\d,]+)\s+([\d,]+)/);
+    if (match) {
+      return { code: match[1], name: match[2].trim(), customer: safeInt(match[3]), house: safeInt(match[4]) };
+    }
+    return null;
+  };
+
+  const issuesMap: Record<string, { code: string; name: string; customer: number; house: number }> = {};
+  const stopsMap: Record<string, { code: string; name: string; customer: number; house: number }> = {};
+  let section: 'none' | 'issues' | 'stops' = 'none';
+
+  for (const line of lines) {
+    const upper = line.toUpperCase();
+    if (upper.includes('ISSUES') && (upper.includes('DELIVERIES MADE') || upper.includes('FIRM CODE') || upper.includes('CUSTOMER'))) {
+      section = 'issues'; continue;
+    }
+    if (upper.includes('STOPS') && (upper.includes('DELIVERIES RECEIVED') || upper.includes('FIRM CODE') || upper.includes('CUSTOMER'))) {
+      section = 'stops'; continue;
+    }
+    if (section === 'none') continue;
+    if (/^(FIRM CODE|FIRM NAME|CUSTOMER|HOUSE|TOTAL:|SETTLEMENT)/.test(upper)) continue;
+
+    const parsed = parseFirmRow(line);
+    if (parsed) {
+      if (section === 'issues') issuesMap[parsed.code] = parsed;
+      else stopsMap[parsed.code] = parsed;
+    }
+  }
+
+  const allCodes = new Set([...Object.keys(issuesMap), ...Object.keys(stopsMap)]);
+  const firms = Array.from(allCodes).map(code => ({
+    firm_code: code,
+    firm_name: issuesMap[code]?.name || stopsMap[code]?.name || 'UNKNOWN',
+    customer_issued: issuesMap[code]?.customer || 0,
+    house_issued: issuesMap[code]?.house || 0,
+    customer_stopped: stopsMap[code]?.customer || 0,
+    house_stopped: stopsMap[code]?.house || 0,
+  }));
+
+  return { reportDate, month, year, metal, firms };
 }
 
 async function parseXls(buffer: Buffer, metal: string) {
@@ -814,6 +966,275 @@ async function startServer() {
         "SELECT * FROM vault_stocks WHERE date = $1 AND metal = $2 ORDER BY (registered_oz + eligible_oz) DESC",
         [date, metal]
       );
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── Institutional Trading Endpoints ──────────────────────────────────────────
+
+  // POST /api/cme/institutional/upload — accepts multipart PDF upload
+  app.post("/api/cme/institutional/upload", upload.single('pdf'), async (req: any, res: any) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: 'No PDF file provided. Use field name "pdf".' });
+      if (!pdfParse) return res.status(500).json({ error: 'pdf-parse module not loaded' });
+
+      const pdfData = await pdfParse(req.file.buffer);
+      const parsed = parseInstitutionalPdf(pdfData.text);
+
+      if (!parsed.reportDate) return res.status(422).json({ error: 'Could not extract report date from PDF.' });
+      if (parsed.firms.length === 0) return res.status(422).json({ error: 'No firm data found in PDF.' });
+
+      const client = await pool.connect();
+      let recordsInserted = 0;
+      try {
+        await client.query('BEGIN');
+
+        for (const firm of parsed.firms) {
+          const totalIssued = firm.customer_issued + firm.house_issued;
+          const totalStopped = firm.customer_stopped + firm.house_stopped;
+          const netPosition = totalStopped - totalIssued;
+          const isNetBuyer = netPosition > 0;
+
+          await client.query(`
+            INSERT INTO institutional_activity
+              (report_date, month, year, firm_code, firm_name, metal,
+               customer_issued, house_issued, total_issued,
+               customer_stopped, house_stopped, total_stopped,
+               net_position, is_net_buyer, source, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'CME YTD Report',NOW())
+            ON CONFLICT(report_date, month, year, firm_code, metal) DO UPDATE SET
+              firm_name = EXCLUDED.firm_name,
+              customer_issued = EXCLUDED.customer_issued,
+              house_issued = EXCLUDED.house_issued,
+              total_issued = EXCLUDED.total_issued,
+              customer_stopped = EXCLUDED.customer_stopped,
+              house_stopped = EXCLUDED.house_stopped,
+              total_stopped = EXCLUDED.total_stopped,
+              net_position = EXCLUDED.net_position,
+              is_net_buyer = EXCLUDED.is_net_buyer,
+              updated_at = NOW()
+          `, [
+            parsed.reportDate, parsed.month, parsed.year,
+            firm.firm_code, firm.firm_name, parsed.metal,
+            firm.customer_issued, firm.house_issued, totalIssued,
+            firm.customer_stopped, firm.house_stopped, totalStopped,
+            netPosition, isNetBuyer
+          ]);
+          recordsInserted++;
+        }
+
+        // Calculate and upsert daily summary
+        const totalIssued = parsed.firms.reduce((s, f) => s + f.customer_issued + f.house_issued, 0);
+        const totalStopped = parsed.firms.reduce((s, f) => s + f.customer_stopped + f.house_stopped, 0);
+        const totalCustomerIssued = parsed.firms.reduce((s, f) => s + f.customer_issued, 0);
+        const totalHouseIssued = parsed.firms.reduce((s, f) => s + f.house_issued, 0);
+        const totalCustomerStopped = parsed.firms.reduce((s, f) => s + f.customer_stopped, 0);
+        const totalHouseStopped = parsed.firms.reduce((s, f) => s + f.house_stopped, 0);
+        const netBuyers = parsed.firms.filter(f => (f.customer_stopped + f.house_stopped) > (f.customer_issued + f.house_issued));
+        const topBuyers = [...parsed.firms]
+          .map(f => ({ ...f, net: (f.customer_stopped + f.house_stopped) - (f.customer_issued + f.house_issued) }))
+          .sort((a, b) => b.net - a.net).slice(0, 10);
+        const topSellers = [...parsed.firms]
+          .map(f => ({ ...f, net: (f.customer_stopped + f.house_stopped) - (f.customer_issued + f.house_issued) }))
+          .sort((a, b) => a.net - b.net).slice(0, 10);
+
+        await client.query(`
+          INSERT INTO institutional_daily_summary
+            (report_date, month, year, metal, total_contracts, total_issued, total_stopped,
+             net_market_position, firms_count, net_buyers_count, net_sellers_count,
+             customer_issued_pct, house_issued_pct, customer_stopped_pct, house_stopped_pct,
+             top_buyers, top_sellers)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+          ON CONFLICT(report_date, metal) DO UPDATE SET
+            total_contracts = EXCLUDED.total_contracts,
+            total_issued = EXCLUDED.total_issued,
+            total_stopped = EXCLUDED.total_stopped,
+            net_market_position = EXCLUDED.net_market_position,
+            firms_count = EXCLUDED.firms_count,
+            net_buyers_count = EXCLUDED.net_buyers_count,
+            net_sellers_count = EXCLUDED.net_sellers_count,
+            customer_issued_pct = EXCLUDED.customer_issued_pct,
+            house_issued_pct = EXCLUDED.house_issued_pct,
+            customer_stopped_pct = EXCLUDED.customer_stopped_pct,
+            house_stopped_pct = EXCLUDED.house_stopped_pct,
+            top_buyers = EXCLUDED.top_buyers,
+            top_sellers = EXCLUDED.top_sellers
+        `, [
+          parsed.reportDate, parsed.month, parsed.year, parsed.metal,
+          totalIssued + totalStopped, totalIssued, totalStopped,
+          totalStopped - totalIssued,
+          parsed.firms.length, netBuyers.length, parsed.firms.length - netBuyers.length,
+          totalIssued > 0 ? +((totalCustomerIssued / totalIssued) * 100).toFixed(2) : null,
+          totalIssued > 0 ? +((totalHouseIssued / totalIssued) * 100).toFixed(2) : null,
+          totalStopped > 0 ? +((totalCustomerStopped / totalStopped) * 100).toFixed(2) : null,
+          totalStopped > 0 ? +((totalHouseStopped / totalStopped) * 100).toFixed(2) : null,
+          JSON.stringify(topBuyers), JSON.stringify(topSellers)
+        ]);
+
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+
+      res.json({
+        success: true,
+        recordsInserted,
+        date: parsed.reportDate,
+        month: parsed.month,
+        year: parsed.year,
+        metal: parsed.metal,
+        summary: {
+          totalFirms: parsed.firms.length,
+          totalIssued: parsed.firms.reduce((s, f) => s + f.customer_issued + f.house_issued, 0),
+          totalStopped: parsed.firms.reduce((s, f) => s + f.customer_stopped + f.house_stopped, 0),
+        }
+      });
+    } catch (error: any) {
+      console.error('❌ Institutional upload error:', error.message);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/latest
+  app.get("/api/cme/institutional/latest", async (req, res) => {
+    try {
+      const metal = (req.query.metal as string) || 'GOLD';
+      const dateResult = await pool.query(
+        "SELECT report_date FROM institutional_activity WHERE metal = $1 ORDER BY report_date DESC LIMIT 1",
+        [metal]
+      );
+      if (!dateResult.rows[0]) return res.json({ data: [], summary: null });
+
+      const date = dateResult.rows[0].report_date;
+      const [activity, summary] = await Promise.all([
+        pool.query(
+          "SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2 ORDER BY net_position DESC",
+          [date, metal]
+        ),
+        pool.query(
+          "SELECT * FROM institutional_daily_summary WHERE report_date = $1 AND metal = $2",
+          [date, metal]
+        )
+      ]);
+
+      res.json({ data: activity.rows, summary: summary.rows[0] || null, date });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/top-traders?date=&limit=10&metal=GOLD
+  app.get("/api/cme/institutional/top-traders", async (req, res) => {
+    try {
+      const metal = (req.query.metal as string) || 'GOLD';
+      const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
+      let date = req.query.date as string;
+
+      if (!date) {
+        const r = await pool.query(
+          "SELECT report_date FROM institutional_activity WHERE metal = $1 ORDER BY report_date DESC LIMIT 1",
+          [metal]
+        );
+        date = r.rows[0]?.report_date;
+      }
+      if (!date) return res.json({ buyers: [], sellers: [], date: null });
+
+      const [buyers, sellers] = await Promise.all([
+        pool.query(
+          "SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2 ORDER BY net_position DESC LIMIT $3",
+          [date, metal, limit]
+        ),
+        pool.query(
+          "SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2 ORDER BY net_position ASC LIMIT $3",
+          [date, metal, limit]
+        )
+      ]);
+
+      res.json({ buyers: buyers.rows, sellers: sellers.rows, date });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/firm/:firmName?days=30&metal=GOLD
+  app.get("/api/cme/institutional/firm/:firmName", async (req, res) => {
+    try {
+      const { firmName } = req.params;
+      const metal = (req.query.metal as string) || 'GOLD';
+      const days = parseInt(req.query.days as string) || 30;
+
+      const result = await pool.query(
+        `SELECT * FROM institutional_activity
+         WHERE (firm_name ILIKE $1 OR firm_code = $2) AND metal = $3
+           AND report_date >= (CURRENT_DATE - INTERVAL '${days} days')::TEXT
+         ORDER BY report_date DESC`,
+        [`%${firmName}%`, firmName, metal]
+      );
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/compare?date1=&date2=&metal=GOLD
+  app.get("/api/cme/institutional/compare", async (req, res) => {
+    try {
+      const { date1, date2 } = req.query as { date1: string; date2: string };
+      const metal = (req.query.metal as string) || 'GOLD';
+      if (!date1 || !date2) return res.status(400).json({ error: 'date1 and date2 are required' });
+
+      const [r1, r2] = await Promise.all([
+        pool.query("SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2", [date1, metal]),
+        pool.query("SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2", [date2, metal])
+      ]);
+
+      const map1: Record<string, any> = {};
+      const map2: Record<string, any> = {};
+      r1.rows.forEach((r: any) => { map1[r.firm_code] = r; });
+      r2.rows.forEach((r: any) => { map2[r.firm_code] = r; });
+
+      const allCodes = new Set([...Object.keys(map1), ...Object.keys(map2)]);
+      const comparison = Array.from(allCodes).map(code => {
+        const a = map1[code];
+        const b = map2[code];
+        const posA = a?.net_position ?? 0;
+        const posB = b?.net_position ?? 0;
+        return {
+          firm_code: code,
+          firm_name: a?.firm_name || b?.firm_name,
+          date1_net: posA,
+          date2_net: posB,
+          change: posA - posB,
+          trend: posA > posB ? 'increasing_buy' : posA < posB ? 'increasing_sell' : 'unchanged',
+          is_new: !b,
+          is_exited: !a
+        };
+      }).sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
+
+      res.json({ comparison, date1, date2, metal });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/summary?startDate=&endDate=&metal=GOLD
+  app.get("/api/cme/institutional/summary", async (req, res) => {
+    try {
+      const { startDate, endDate } = req.query as { startDate: string; endDate: string };
+      const metal = (req.query.metal as string) || 'GOLD';
+
+      let query = "SELECT * FROM institutional_daily_summary WHERE metal = $1";
+      const params: any[] = [metal];
+      if (startDate) { query += ` AND report_date >= $${params.length + 1}`; params.push(startDate); }
+      if (endDate)   { query += ` AND report_date <= $${params.length + 1}`; params.push(endDate); }
+      query += " ORDER BY report_date DESC LIMIT 90";
+
+      const result = await pool.query(query, params);
       res.json(result.rows);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

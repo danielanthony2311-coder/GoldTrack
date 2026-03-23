@@ -3,6 +3,7 @@ import { Upload, Download, Filter, ChevronRight, AlertCircle, RefreshCw, Loader2
 import { cn } from '../utils/cn';
 import HistoricalComparisonChart from '../components/HistoricalComparisonChart';
 import MetalsSummary from '../components/MetalsSummary';
+import InstitutionalActivity from '../components/InstitutionalActivity';
 
 interface DeliveryNotice {
   id: number;
@@ -320,6 +321,9 @@ export default function ComexDetails() {
           </div>
         </div>
       )}
+
+      {/* Institutional Activity */}
+      <InstitutionalActivity metal={selectedMetal} />
 
       {/* Alert System */}
       <div className="bg-gold-500/10 border border-gold-500/20 p-6 rounded-2xl flex gap-4">
