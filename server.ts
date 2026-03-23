@@ -572,8 +572,12 @@ async function parseXls(buffer: Buffer, metal: string) {
     if (!row) continue;
     const rowStr = row.join(" ").toLowerCase();
     if (rowStr.includes("as of date:")) {
-      const dateMatch = rowStr.match(/(\d{1,2}\/\d{1,2}\/\d{2,4})/);
-      if (dateMatch) reportDate = new Date(dateMatch[1]).toISOString().split('T')[0];
+      const dateMatch = rowStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+      if (dateMatch) {
+        const [, m, d, y] = dateMatch;
+        const fullYear = y.length === 2 ? `20${y}` : y;
+        reportDate = `${fullYear}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+      }
     }
   }
 
@@ -662,6 +666,7 @@ async function startServer() {
     const results: any = {
       success: true,
       files: {},
+      parsed: {},   // date extracted per file
       errors: []
     };
 
@@ -702,6 +707,7 @@ async function startServer() {
     const processXlsData = async (data: any, metal: string) => {
       if (!data) return;
       const parsed = await parseXls(Buffer.from(data), metal);
+      results.parsed[`${metal.toLowerCase()}Xls`] = parsed.reportDate;
 
       // Calculate deltas vs previous row for same metal
       const prevResult = await pool.query(
@@ -785,6 +791,7 @@ async function startServer() {
       const pdfData = await pdfParse(Buffer.from(data));
       const parsedData = parseCMEPdf(pdfData.text, filename);
       const reportDate = parsedData.business_date;
+      results.parsed[filename] = reportDate || 'NOT FOUND';
       if (!reportDate) {
         console.warn(`⚠️ No business date found in ${filename} — skipping DB write`);
         return;
