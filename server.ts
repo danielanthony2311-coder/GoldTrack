@@ -11,7 +11,17 @@ const require = createRequire(import.meta.url);
 // multer is a CJS module for multipart/form-data file uploads
 const _multerRaw = require('multer');
 const multer = (typeof _multerRaw === 'function' ? _multerRaw : _multerRaw?.default ?? _multerRaw) as any;
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (_req: any, file: any, cb: any) => {
+    if (file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are accepted'));
+    }
+  },
+});
 
 // pdf-parse: try direct lib path first (avoids test-file read bug in some versions), then fall back
 let pdfParse: ((buf: Buffer, opts?: any) => Promise<{ text: string }>) | null = null;
@@ -654,6 +664,10 @@ async function parseXls(buffer: Buffer, metal: string) {
   return { reportDate, registered, eligible, total, vaultData };
 }
 
+// Rate-limit the CME sync endpoint: at most once per 60 seconds
+let lastSyncTime = 0;
+const SYNC_COOLDOWN_MS = 60_000;
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -667,6 +681,14 @@ async function startServer() {
 
   // 1. Consolidated Sync from CME
   app.get("/api/cme/sync", async (req, res) => {
+    const now = Date.now();
+    if (now - lastSyncTime < SYNC_COOLDOWN_MS) {
+      const retryAfter = Math.ceil((SYNC_COOLDOWN_MS - (now - lastSyncTime)) / 1000);
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({ error: `Sync cooldown active. Try again in ${retryAfter}s.` });
+    }
+    lastSyncTime = now;
+
     const urls = {
       goldXls: "https://www.cmegroup.com/delivery_reports/Gold_Stocks.xls",
       silverXls: "https://www.cmegroup.com/delivery_reports/Silver_Stocks.xls",
@@ -1014,7 +1036,7 @@ async function startServer() {
   // 4. Get Latest Delivery Notices
   app.get("/api/cme/latest-notices", async (req, res) => {
     try {
-      const metal = req.query.metal || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       let date = req.query.date as string | undefined;
       if (!date) {
         const dateResult = await pool.query(
@@ -1038,7 +1060,7 @@ async function startServer() {
   // 2. Get Latest Stocks (History)
   app.get("/api/cme/latest-stocks", async (req, res) => {
     try {
-      const metal = req.query.metal || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       const result = await pool.query(
         "SELECT * FROM warehouse_stocks WHERE metal = $1 ORDER BY date ASC",
         [metal]
@@ -1063,7 +1085,7 @@ async function startServer() {
   // GET /api/logs/:type?lines=500  — return last N lines as JSON array
   app.get("/api/logs/:type", (req, res) => {
     const { type } = req.params;
-    const lines = Math.min(parseInt(req.query.lines as string) || 500, 2000);
+    const lines = Math.max(1, Math.min(parseInt(req.query.lines as string) || 500, 2000));
     const logFile = type === 'frontend' ? FRONTEND_LOG : BACKEND_LOG;
     try {
       if (!fs.existsSync(logFile)) return res.json([]);
@@ -1130,7 +1152,7 @@ async function startServer() {
 
   app.get("/api/history", async (req, res) => {
     try {
-      const metal = req.query.metal || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       const result = await pool.query(
         "SELECT * FROM warehouse_stocks WHERE metal = $1 ORDER BY date ASC",
         [metal]
@@ -1144,7 +1166,7 @@ async function startServer() {
   // 7. Get Vault Breakdown
   app.get("/api/cme/vault-breakdown", async (req, res) => {
     try {
-      const metal = req.query.metal || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       let date = req.query.date as string | undefined;
       if (!date) {
         const dateResult = await pool.query(
@@ -1295,7 +1317,7 @@ async function startServer() {
   // GET /api/cme/institutional/latest
   app.get("/api/cme/institutional/latest", async (req, res) => {
     try {
-      const metal = (req.query.metal as string) || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       const dateResult = await pool.query(
         "SELECT report_date FROM institutional_activity WHERE metal = $1 ORDER BY report_date DESC LIMIT 1",
         [metal]
@@ -1323,8 +1345,8 @@ async function startServer() {
   // GET /api/cme/institutional/top-traders?date=&limit=10&metal=GOLD
   app.get("/api/cme/institutional/top-traders", async (req, res) => {
     try {
-      const metal = (req.query.metal as string) || 'GOLD';
-      const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
+      const limit = Math.max(1, Math.min(parseInt(req.query.limit as string) || 10, 50));
       let date = req.query.date as string;
 
       if (!date) {
@@ -1357,15 +1379,17 @@ async function startServer() {
   app.get("/api/cme/institutional/firm/:firmName", async (req, res) => {
     try {
       const { firmName } = req.params;
-      const metal = (req.query.metal as string) || 'GOLD';
-      const days = parseInt(req.query.days as string) || 30;
+      const METALS = ['GOLD', 'SILVER'];
+      const metal = METALS.includes((req.query.metal as string)?.toUpperCase())
+        ? (req.query.metal as string).toUpperCase() : 'GOLD';
+      const days = Math.max(1, Math.min(parseInt(req.query.days as string) || 30, 365));
 
       const result = await pool.query(
         `SELECT * FROM institutional_activity
          WHERE (firm_name ILIKE $1 OR firm_code = $2) AND metal = $3
-           AND report_date >= (CURRENT_DATE - INTERVAL '${days} days')::TEXT
+           AND report_date >= (CURRENT_DATE - ($4 * INTERVAL '1 day'))::TEXT
          ORDER BY report_date DESC`,
-        [`%${firmName}%`, firmName, metal]
+        [`%${firmName}%`, firmName, metal, days]
       );
       res.json(result.rows);
     } catch (error: any) {
@@ -1377,7 +1401,7 @@ async function startServer() {
   app.get("/api/cme/institutional/compare", async (req, res) => {
     try {
       const { date1, date2 } = req.query as { date1: string; date2: string };
-      const metal = (req.query.metal as string) || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       if (!date1 || !date2) return res.status(400).json({ error: 'date1 and date2 are required' });
 
       const [r1, r2] = await Promise.all([
@@ -1418,7 +1442,7 @@ async function startServer() {
   app.get("/api/cme/institutional/summary", async (req, res) => {
     try {
       const { startDate, endDate } = req.query as { startDate: string; endDate: string };
-      const metal = (req.query.metal as string) || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
 
       let query = "SELECT * FROM institutional_daily_summary WHERE metal = $1";
       const params: any[] = [metal];
@@ -1453,24 +1477,16 @@ async function startServer() {
     });
   }
 
+  // Global error handler — catches errors passed via next(err) or thrown in async middleware
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    console.error(`[error] Unhandled: ${err?.message ?? err}`);
+    const status = typeof err?.status === 'number' ? err.status : 500;
+    res.status(status).json({ error: err?.message ?? 'Internal server error' });
+  });
+
   app.listen(PORT, "0.0.0.0", async () => {
     console.log(`Server running on http://localhost:${PORT}`);
 
-    // BUG 4: Restore lost March 16 data
-    try {
-      const existsResult = await pool.query(
-        "SELECT 1 FROM warehouse_stocks WHERE date = '2026-03-16' AND metal = 'GOLD'"
-      );
-      if (existsResult.rows.length === 0) {
-        await pool.query(`
-          INSERT INTO warehouse_stocks (date, metal, registered_oz, eligible_oz, total_oz, daily_change_registered, daily_change_eligible, created_at)
-          VALUES ('2026-03-16', 'GOLD', 16695520, 15856042, 32551562, 0, 0, '2026-03-16 14:28:34')
-        `);
-        console.log("✅ Restored March 16 data point.");
-      }
-    } catch (e) {
-      console.error("Failed to restore March 16 data:", e);
-    }
   });
 }
 
