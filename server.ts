@@ -691,7 +691,7 @@ async function startServer() {
 
     const urls = {
       goldXls: "https://www.cmegroup.com/delivery_reports/Gold_Stocks.xls",
-      silverXls: "https://www.cmegroup.com/delivery_reports/Silver_Stocks.xls",
+      silverXls: "https://www.cmegroup.com/delivery_reports/Silver_stocks.xls",
       mtdPdf: "https://www.cmegroup.com/delivery_reports/MetalsIssuesAndStopsMTDReport.pdf",
       dailyPdf: "https://www.cmegroup.com/delivery_reports/MetalsIssuesAndStopsReport.pdf"
     };
