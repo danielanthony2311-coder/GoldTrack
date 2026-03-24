@@ -721,6 +721,8 @@ async function startServer() {
 
     // ── Step 1: Visit the landing page first (harvests cookies + looks natural) ─
     let sessionCookies = '';
+    let discoveredGoldXls = urls.goldXls;
+    let discoveredSilverXls = urls.silverXls;
     try {
       console.log('🌐 [sync] Visiting CME delivery reports landing page…');
       const landingRes = await axios.get('https://www.cmegroup.com/delivery_reports/', {
@@ -748,6 +750,21 @@ async function startServer() {
           .filter(Boolean)
           .join('; ');
         console.log(`🍪 [sync] Harvested ${setCookieHeader.length} cookie(s) from landing page`);
+      }
+      // Parse HTML to discover actual XLS download URLs (avoids stale hardcoded paths)
+      const html: string = typeof landingRes.data === 'string'
+        ? landingRes.data
+        : landingRes.data.toString('utf8');
+      const xlsLinks = [...html.matchAll(/href="([^"]*\.xls[^"]*)"/gi)].map(m => m[1]);
+      for (const href of xlsLinks) {
+        const full = href.startsWith('http') ? href : `https://www.cmegroup.com${href}`;
+        if (/gold/i.test(href)) {
+          discoveredGoldXls = full;
+          console.log(`🔗 [sync] Discovered goldXls URL: ${full}`);
+        } else if (/silver/i.test(href)) {
+          discoveredSilverXls = full;
+          console.log(`🔗 [sync] Discovered silverXls URL: ${full}`);
+        }
       }
     } catch (err: any) {
       console.warn(`⚠️ [sync] Landing page visit failed (non-fatal): ${err.message}`);
@@ -821,8 +838,8 @@ async function startServer() {
 
     // Sequential fetches with human-paced delays between each one
     const fileOrder: [string, string][] = [
-      ['goldXls',   urls.goldXls],
-      ['silverXls', urls.silverXls],
+      ['goldXls',   discoveredGoldXls],
+      ['silverXls', discoveredSilverXls],
       ['mtdPdf',    urls.mtdPdf],
       ['dailyPdf',  urls.dailyPdf],
     ];
