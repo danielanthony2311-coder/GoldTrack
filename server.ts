@@ -8,17 +8,28 @@ import * as XLSX from "xlsx";
 import fs from "fs";
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-// pdf-parse is a CJS module; unwrap .default if the CJS shim wraps it
-const _pdfParseRaw = require('pdf-parse');
 // multer is a CJS module for multipart/form-data file uploads
 const _multerRaw = require('multer');
 const multer = (typeof _multerRaw === 'function' ? _multerRaw : _multerRaw?.default ?? _multerRaw) as any;
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
-const pdfParse: (buf: Buffer) => Promise<{ text: string }> =
-  typeof _pdfParseRaw === 'function' ? _pdfParseRaw
-  : typeof _pdfParseRaw?.default === 'function' ? _pdfParseRaw.default
-  : typeof _pdfParseRaw?.parse === 'function' ? _pdfParseRaw.parse
-  : null;
+
+// pdf-parse: try direct lib path first (avoids test-file read bug in some versions), then fall back
+let pdfParse: ((buf: Buffer, opts?: any) => Promise<{ text: string }>) | null = null;
+try {
+  const raw = require('pdf-parse/lib/pdf-parse.js');
+  pdfParse = typeof raw === 'function' ? raw : raw?.default ?? null;
+} catch {
+  try {
+    const raw = require('pdf-parse');
+    pdfParse = typeof raw === 'function' ? raw
+      : typeof raw?.default === 'function' ? raw.default
+      : typeof raw?.parse === 'function' ? raw.parse
+      : null;
+  } catch (e: any) {
+    console.error('⚠️  pdf-parse failed to load:', e.message);
+  }
+}
+console.log(`[startup] pdf-parse loaded: ${pdfParse !== null}`);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -670,23 +681,40 @@ async function startServer() {
       errors: []
     };
 
+    const UA_LIST = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+    ];
     const fetchFile = async (name: string, url: string, type: 'arraybuffer') => {
-      try {
-        console.log(`🔄 Fetching ${name} from: ${url}`);
-        const response = await axios.get(url, {
-          responseType: type,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      for (let attempt = 0; attempt < UA_LIST.length; attempt++) {
+        try {
+          console.log(`🔄 Fetching ${name} (attempt ${attempt + 1}) from: ${url}`);
+          const response = await axios.get(url, {
+            responseType: type,
+            timeout: 30000,
+            headers: {
+              'User-Agent': UA_LIST[attempt],
+              'Accept': '*/*',
+              'Accept-Language': 'en-US,en;q=0.9',
+              'Referer': 'https://www.cmegroup.com/',
+            }
+          });
+          results.files[name] = { status: response.status };
+          return response.data;
+        } catch (error: any) {
+          const status = error.response?.status || 'FETCH_ERROR';
+          if (status === 403 && attempt < UA_LIST.length - 1) {
+            console.warn(`⚠️ ${name} got 403, retrying with different UA…`);
+            await new Promise(r => setTimeout(r, 1500));
+            continue;
           }
-        });
-        results.files[name] = { status: response.status, data: response.data };
-        return response.data;
-      } catch (error: any) {
-        const status = error.response?.status || 'FETCH_ERROR';
-        results.errors.push({ file: name, url, status, message: error.message });
-        console.error(`❌ Error fetching ${name}: ${error.message}`);
-        return null;
+          results.errors.push({ file: name, url, status, message: error.message });
+          console.error(`❌ Error fetching ${name}: ${error.message}`);
+          return null;
+        }
       }
+      return null;
     };
 
     // Fetch all files
@@ -696,12 +724,6 @@ async function startServer() {
       fetchFile('mtdPdf', urls.mtdPdf, 'arraybuffer'),
       fetchFile('dailyPdf', urls.dailyPdf, 'arraybuffer')
     ]);
-
-    if (!pdfParse) {
-      results.errors.push({ file: 'pdf-parse', message: 'pdf-parse module failed to load — check npm install' });
-      results.success = false;
-      return res.json(results);
-    }
 
     // Process XLS Files
     const processXlsData = async (data: any, metal: string) => {
@@ -786,8 +808,12 @@ async function startServer() {
     }
 
     // Process PDF Files
+    if (!pdfParse) {
+      results.errors.push({ file: 'pdf-parse', message: 'pdf-parse module not available — PDF data skipped, XLS data was still saved' });
+    }
+
     const processPdfData = async (data: any, filename: string) => {
-      if (!data) return;
+      if (!data || !pdfParse) return;
       const pdfData = await pdfParse(Buffer.from(data));
       const parsedData = parseCMEPdf(pdfData.text, filename);
       const reportDate = parsedData.business_date;
