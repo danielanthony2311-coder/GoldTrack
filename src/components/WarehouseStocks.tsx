@@ -80,14 +80,17 @@ export default function WarehouseStocks() {
       
       setDebugInfo(result);
 
-      if (!response.ok || !result.success) {
-        const detail = result.errors?.length
-          ? result.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n')
-          : 'CME Sync failed';
-        throw new Error(detail);
-      }
-      
+      // Always refresh charts — gold may have synced even if silver 403'd
       await fetchData();
+
+      // Surface partial errors as warnings (don't block chart update)
+      if (!response.ok) {
+        throw new Error('Sync request failed');
+      }
+      if (result.errors?.length) {
+        const detail = result.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n');
+        setError(`Partial sync — some files failed:\n${detail}`);
+      }
     } catch (err: any) {
       console.error(err);
       setError(err.message);

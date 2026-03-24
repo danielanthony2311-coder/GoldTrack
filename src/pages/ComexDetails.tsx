@@ -3,6 +3,7 @@ import { Upload, Download, Filter, ChevronRight, AlertCircle, RefreshCw, Loader2
 import { cn } from '../utils/cn';
 import HistoricalComparisonChart from '../components/HistoricalComparisonChart';
 import MetalsSummary from '../components/MetalsSummary';
+import InstitutionalActivity from '../components/InstitutionalActivity';
 
 interface DeliveryNotice {
   id: number;
@@ -79,14 +80,14 @@ export default function ComexDetails() {
     try {
       const response = await fetch('/api/cme/sync');
       const syncResult = await response.json();
-      if (!response.ok || !syncResult.success) {
-        const detail = syncResult.errors?.length
-          ? syncResult.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n')
-          : 'Sync failed';
-        throw new Error(detail);
-      }
-      
+      // Always refresh — partial syncs (e.g. silver 403) still write gold data
       await fetchData();
+
+      if (!response.ok) throw new Error('Sync request failed');
+      if (syncResult.errors?.length) {
+        const detail = syncResult.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n');
+        setError(`Partial sync — some files failed:\n${detail}`);
+      }
       setRefreshKey(prev => prev + 1);
     } catch (err: any) {
       console.error(err);
@@ -320,6 +321,9 @@ export default function ComexDetails() {
           </div>
         </div>
       )}
+
+      {/* Institutional Activity */}
+      <InstitutionalActivity metal={selectedMetal} />
 
       {/* Alert System */}
       <div className="bg-gold-500/10 border border-gold-500/20 p-6 rounded-2xl flex gap-4">

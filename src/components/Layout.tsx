@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, BarChart3, Globe, Menu, X, TrendingUp, Zap } from 'lucide-react';
+import { LayoutDashboard, BarChart3, Globe, Menu, X, TrendingUp, Zap, ScrollText } from 'lucide-react';
 import { cn } from '../utils/cn';
 
 interface LayoutProps {
@@ -16,6 +16,7 @@ export default function Layout({ children }: LayoutProps) {
     { name: 'COMEX Details', href: '/comex', icon: BarChart3 },
     { name: 'CB Tracker', href: '/cb-tracker', icon: Globe },
     { name: 'Mining Synergy', href: '/mining-synergy', icon: Zap },
+    { name: 'Logs', href: '/logs', icon: ScrollText },
   ];
 
   return (

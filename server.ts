@@ -8,13 +8,38 @@ import * as XLSX from "xlsx";
 import fs from "fs";
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-// pdf-parse is a CJS module; unwrap .default if the CJS shim wraps it
-const _pdfParseRaw = require('pdf-parse');
-const pdfParse: (buf: Buffer) => Promise<{ text: string }> =
-  typeof _pdfParseRaw === 'function' ? _pdfParseRaw
-  : typeof _pdfParseRaw?.default === 'function' ? _pdfParseRaw.default
-  : typeof _pdfParseRaw?.parse === 'function' ? _pdfParseRaw.parse
-  : null;
+// multer is a CJS module for multipart/form-data file uploads
+const _multerRaw = require('multer');
+const multer = (typeof _multerRaw === 'function' ? _multerRaw : _multerRaw?.default ?? _multerRaw) as any;
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (_req: any, file: any, cb: any) => {
+    if (file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are accepted'));
+    }
+  },
+});
+
+// pdf-parse: try direct lib path first (avoids test-file read bug in some versions), then fall back
+let pdfParse: ((buf: Buffer, opts?: any) => Promise<{ text: string }>) | null = null;
+try {
+  const raw = require('pdf-parse/lib/pdf-parse.js');
+  pdfParse = typeof raw === 'function' ? raw : raw?.default ?? null;
+} catch {
+  try {
+    const raw = require('pdf-parse');
+    pdfParse = typeof raw === 'function' ? raw
+      : typeof raw?.default === 'function' ? raw.default
+      : typeof raw?.parse === 'function' ? raw.parse
+      : null;
+  } catch (e: any) {
+    console.error('⚠️  pdf-parse failed to load:', e.message);
+  }
+}
+console.log(`[startup] pdf-parse loaded: ${pdfParse !== null}`);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -212,11 +237,65 @@ async function initDb() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS institutional_activity (
+      id SERIAL PRIMARY KEY,
+      report_date TEXT NOT NULL,
+      month INTEGER NOT NULL,
+      year INTEGER NOT NULL,
+      firm_code TEXT NOT NULL,
+      firm_name TEXT NOT NULL,
+      metal TEXT NOT NULL DEFAULT 'GOLD',
+      customer_issued INTEGER DEFAULT 0,
+      house_issued INTEGER DEFAULT 0,
+      total_issued INTEGER DEFAULT 0,
+      customer_stopped INTEGER DEFAULT 0,
+      house_stopped INTEGER DEFAULT 0,
+      total_stopped INTEGER DEFAULT 0,
+      net_position INTEGER DEFAULT 0,
+      is_net_buyer BOOLEAN DEFAULT false,
+      source TEXT DEFAULT 'CME YTD Report',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(report_date, month, year, firm_code, metal)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS institutional_daily_summary (
+      id SERIAL PRIMARY KEY,
+      report_date TEXT NOT NULL,
+      month INTEGER NOT NULL,
+      year INTEGER NOT NULL,
+      metal TEXT NOT NULL DEFAULT 'GOLD',
+      total_contracts INTEGER NOT NULL DEFAULT 0,
+      total_issued INTEGER NOT NULL DEFAULT 0,
+      total_stopped INTEGER NOT NULL DEFAULT 0,
+      net_market_position INTEGER NOT NULL DEFAULT 0,
+      firms_count INTEGER NOT NULL DEFAULT 0,
+      net_buyers_count INTEGER NOT NULL DEFAULT 0,
+      net_sellers_count INTEGER NOT NULL DEFAULT 0,
+      customer_issued_pct NUMERIC(5,2),
+      house_issued_pct NUMERIC(5,2),
+      customer_stopped_pct NUMERIC(5,2),
+      house_stopped_pct NUMERIC(5,2),
+      top_buyers JSONB,
+      top_sellers JSONB,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(report_date, metal)
+    )
+  `);
+
   // Indexes for common filter patterns
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_warehouse_metal_date ON warehouse_stocks(metal, date DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_vault_metal_date ON vault_stocks(metal, date DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_notices_metal_date ON delivery_notices(metal, date DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_summary_metal_date ON metals_summary(metal, date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_institutional_date ON institutional_activity(report_date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_institutional_firm ON institutional_activity(firm_name, report_date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_institutional_net ON institutional_activity(net_position DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_institutional_month_year ON institutional_activity(year DESC, month DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_daily_summary_date ON institutional_daily_summary(report_date DESC)`);
 
   console.log("✅ Database tables and indexes ensured.");
 }
@@ -403,6 +482,100 @@ function processSection(lines: string[], type: string, metal: string) {
   return result;
 }
 
+function parseInstitutionalPdf(text: string) {
+  const MONTH_NAMES = ['JANUARY','FEBRUARY','MARCH','APRIL','MAY','JUNE','JULY','AUGUST','SEPTEMBER','OCTOBER','NOVEMBER','DECEMBER'];
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+  let metal = 'GOLD';
+  if (text.toUpperCase().includes('SILVER') && !text.toUpperCase().includes('GOLD')) metal = 'SILVER';
+
+  let reportDate = '';
+  let month = 0;
+  let year = 0;
+
+  for (const line of lines) {
+    if (line.toUpperCase().includes('BUSINESS DATE:')) {
+      const match = line.match(/(\d{1,2}\/\d{1,2}\/\d{4})/);
+      if (match) {
+        const [m, d, y] = match[1].split('/');
+        reportDate = `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+        month = parseInt(m, 10);
+        year = parseInt(y, 10);
+      }
+    }
+    if (!month) {
+      const headerMatch = line.match(/(\w+)\s+(\d{4})\s*$/);
+      if (headerMatch && line.toUpperCase().includes('FUTURES')) {
+        const mIdx = MONTH_NAMES.indexOf(headerMatch[1].toUpperCase());
+        if (mIdx >= 0) {
+          month = mIdx + 1;
+          year = parseInt(headerMatch[2], 10);
+          if (!reportDate) {
+            const today = new Date();
+            if (year === today.getFullYear() && month === today.getMonth() + 1) {
+              reportDate = today.toISOString().split('T')[0];
+            } else {
+              const lastDay = new Date(year, month, 0).getDate();
+              reportDate = `${year}-${String(month).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const parseFirmRow = (line: string): { code: string; name: string; customer: number; house: number } | null => {
+    const safeInt = (s: string) => { const n = parseInt((s || '').replace(/,/g,''), 10); return isNaN(n) ? 0 : n; };
+    // Pipe-separated: "661 | JP MORGAN SECURITIES | 12,100 | 0 | 12,100"
+    if (line.includes('|')) {
+      const parts = line.split('|').map(p => p.trim());
+      const code = parts[0]?.match(/^(\d{3})/)?.[1];
+      if (!code || parts.length < 4) return null;
+      return { code, name: parts[1], customer: safeInt(parts[2]), house: safeInt(parts[3]) };
+    }
+    // Space-separated fixed-width: "661  JP MORGAN SECURITIES  12,100  0  12,100"
+    const match = line.match(/^(\d{3})\s{1,4}(.+?)\s{2,}([\d,]+)\s+([\d,]+)/);
+    if (match) {
+      return { code: match[1], name: match[2].trim(), customer: safeInt(match[3]), house: safeInt(match[4]) };
+    }
+    return null;
+  };
+
+  const issuesMap: Record<string, { code: string; name: string; customer: number; house: number }> = {};
+  const stopsMap: Record<string, { code: string; name: string; customer: number; house: number }> = {};
+  let section: 'none' | 'issues' | 'stops' = 'none';
+
+  for (const line of lines) {
+    const upper = line.toUpperCase();
+    if (upper.includes('ISSUES') && (upper.includes('DELIVERIES MADE') || upper.includes('FIRM CODE') || upper.includes('CUSTOMER'))) {
+      section = 'issues'; continue;
+    }
+    if (upper.includes('STOPS') && (upper.includes('DELIVERIES RECEIVED') || upper.includes('FIRM CODE') || upper.includes('CUSTOMER'))) {
+      section = 'stops'; continue;
+    }
+    if (section === 'none') continue;
+    if (/^(FIRM CODE|FIRM NAME|CUSTOMER|HOUSE|TOTAL:|SETTLEMENT)/.test(upper)) continue;
+
+    const parsed = parseFirmRow(line);
+    if (parsed) {
+      if (section === 'issues') issuesMap[parsed.code] = parsed;
+      else stopsMap[parsed.code] = parsed;
+    }
+  }
+
+  const allCodes = new Set([...Object.keys(issuesMap), ...Object.keys(stopsMap)]);
+  const firms = Array.from(allCodes).map(code => ({
+    firm_code: code,
+    firm_name: issuesMap[code]?.name || stopsMap[code]?.name || 'UNKNOWN',
+    customer_issued: issuesMap[code]?.customer || 0,
+    house_issued: issuesMap[code]?.house || 0,
+    customer_stopped: stopsMap[code]?.customer || 0,
+    house_stopped: stopsMap[code]?.house || 0,
+  }));
+
+  return { reportDate, month, year, metal, firms };
+}
+
 async function parseXls(buffer: Buffer, metal: string) {
   const workbook = XLSX.read(buffer, { type: "buffer" });
   const sheetName = workbook.SheetNames[0];
@@ -420,8 +593,12 @@ async function parseXls(buffer: Buffer, metal: string) {
     if (!row) continue;
     const rowStr = row.join(" ").toLowerCase();
     if (rowStr.includes("as of date:")) {
-      const dateMatch = rowStr.match(/(\d{1,2}\/\d{1,2}\/\d{2,4})/);
-      if (dateMatch) reportDate = new Date(dateMatch[1]).toISOString().split('T')[0];
+      const dateMatch = rowStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+      if (dateMatch) {
+        const [, m, d, y] = dateMatch;
+        const fullYear = y.length === 2 ? `20${y}` : y;
+        reportDate = `${fullYear}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+      }
     }
   }
 
@@ -487,6 +664,10 @@ async function parseXls(buffer: Buffer, metal: string) {
   return { reportDate, registered, eligible, total, vaultData };
 }
 
+// Rate-limit the CME sync endpoint: at most once per 60 seconds
+let lastSyncTime = 0;
+const SYNC_COOLDOWN_MS = 60_000;
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -500,6 +681,14 @@ async function startServer() {
 
   // 1. Consolidated Sync from CME
   app.get("/api/cme/sync", async (req, res) => {
+    const now = Date.now();
+    if (now - lastSyncTime < SYNC_COOLDOWN_MS) {
+      const retryAfter = Math.ceil((SYNC_COOLDOWN_MS - (now - lastSyncTime)) / 1000);
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({ error: `Sync cooldown active. Try again in ${retryAfter}s.` });
+    }
+    lastSyncTime = now;
+
     const urls = {
       goldXls: "https://www.cmegroup.com/delivery_reports/Gold_Stocks.xls",
       silverXls: "https://www.cmegroup.com/delivery_reports/Silver_Stocks.xls",
@@ -510,46 +699,148 @@ async function startServer() {
     const results: any = {
       success: true,
       files: {},
+      parsed: {},
       errors: []
     };
 
-    const fetchFile = async (name: string, url: string, type: 'arraybuffer') => {
-      try {
-        console.log(`🔄 Fetching ${name} from: ${url}`);
-        const response = await axios.get(url, {
-          responseType: type,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          }
-        });
-        results.files[name] = { status: response.status, data: response.data };
-        return response.data;
-      } catch (error: any) {
-        const status = error.response?.status || 'FETCH_ERROR';
-        results.errors.push({ file: name, url, status, message: error.message });
-        console.error(`❌ Error fetching ${name}: ${error.message}`);
-        return null;
-      }
+    // ── Human-like helpers ────────────────────────────────────────────────────
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+    // Random delay in [minMs, maxMs] with gaussian-ish distribution (average of 3 randoms)
+    const humanDelay = (minMs: number, maxMs: number) => {
+      const r = (Math.random() + Math.random() + Math.random()) / 3; // bell-curve [0,1]
+      return sleep(Math.round(minMs + r * (maxMs - minMs)));
     };
 
-    // Fetch all files
-    const [goldXlsData, silverXlsData, mtdPdfData, dailyPdfData] = await Promise.all([
-      fetchFile('goldXls', urls.goldXls, 'arraybuffer'),
-      fetchFile('silverXls', urls.silverXls, 'arraybuffer'),
-      fetchFile('mtdPdf', urls.mtdPdf, 'arraybuffer'),
-      fetchFile('dailyPdf', urls.dailyPdf, 'arraybuffer')
-    ]);
+    // Pick a consistent UA for this session (Chrome on Windows, latest-ish build)
+    const UA_LIST = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    ];
+    const sessionUA = UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
 
-    if (!pdfParse) {
-      results.errors.push({ file: 'pdf-parse', message: 'pdf-parse module failed to load — check npm install' });
-      results.success = false;
-      return res.json(results);
+    // ── Step 1: Visit the landing page first (harvests cookies + looks natural) ─
+    let sessionCookies = '';
+    try {
+      console.log('🌐 [sync] Visiting CME delivery reports landing page…');
+      const landingRes = await axios.get('https://www.cmegroup.com/delivery_reports/', {
+        timeout: 20000,
+        headers: {
+          'User-Agent': sessionUA,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-User': '?1',
+          'Cache-Control': 'max-age=0',
+        },
+        maxRedirects: 5,
+      });
+      // Harvest all Set-Cookie values into a single Cookie header string
+      const setCookieHeader = landingRes.headers['set-cookie'];
+      if (setCookieHeader) {
+        sessionCookies = (Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader])
+          .map(c => c.split(';')[0].trim())
+          .filter(Boolean)
+          .join('; ');
+        console.log(`🍪 [sync] Harvested ${setCookieHeader.length} cookie(s) from landing page`);
+      }
+    } catch (err: any) {
+      console.warn(`⚠️ [sync] Landing page visit failed (non-fatal): ${err.message}`);
     }
+
+    // Simulate page-load reading time before the user "clicks" a download link
+    await humanDelay(3000, 6000);
+
+    // ── Step 2: Fetch each file sequentially with inter-request human delays ──
+    const fetchFile = async (name: string, url: string) => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          console.log(`🔄 [sync] Fetching ${name} (attempt ${attempt + 1})…`);
+          const headers: Record<string, string> = {
+            'User-Agent': sessionUA,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Referer': 'https://www.cmegroup.com/delivery_reports/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+          };
+          if (sessionCookies) headers['Cookie'] = sessionCookies;
+
+          const response = await axios.get(url, {
+            responseType: 'arraybuffer',
+            timeout: 30000,
+            headers,
+            maxRedirects: 5,
+          });
+
+          // Merge any new cookies from this response
+          const newCookies = response.headers['set-cookie'];
+          if (newCookies) {
+            const merged = new Map<string, string>();
+            // Existing cookies
+            sessionCookies.split('; ').filter(Boolean).forEach(c => {
+              const [k, v] = c.split('=');
+              if (k) merged.set(k.trim(), v ?? '');
+            });
+            // New cookies override
+            (Array.isArray(newCookies) ? newCookies : [newCookies]).forEach(c => {
+              const part = c.split(';')[0].trim();
+              const [k, v] = part.split('=');
+              if (k) merged.set(k.trim(), v ?? '');
+            });
+            sessionCookies = [...merged.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+          }
+
+          results.files[name] = { status: response.status };
+          console.log(`✅ [sync] ${name} fetched (${Math.round(response.data.byteLength / 1024)} KB)`);
+          return response.data;
+        } catch (error: any) {
+          const status = error.response?.status || 'FETCH_ERROR';
+          if (attempt < 2) {
+            console.warn(`⚠️ [sync] ${name} got ${status}, waiting before retry…`);
+            await humanDelay(4000, 9000); // longer back-off on failure
+            continue;
+          }
+          results.errors.push({ file: name, url, status, message: error.message });
+          console.error(`❌ [sync] Failed to fetch ${name}: ${error.message}`);
+          return null;
+        }
+      }
+      return null;
+    };
+
+    // Sequential fetches with human-paced delays between each one
+    const fileOrder: [string, string][] = [
+      ['goldXls',   urls.goldXls],
+      ['silverXls', urls.silverXls],
+      ['mtdPdf',    urls.mtdPdf],
+      ['dailyPdf',  urls.dailyPdf],
+    ];
+    const fetchedData: Record<string, any> = {};
+    for (const [name, url] of fileOrder) {
+      fetchedData[name] = await fetchFile(name, url);
+      if (name !== fileOrder[fileOrder.length - 1][0]) {
+        // 3–8 seconds between downloads (like a human clicking each link)
+        await humanDelay(3000, 8000);
+      }
+    }
+    const { goldXls: goldXlsData, silverXls: silverXlsData, mtdPdf: mtdPdfData, dailyPdf: dailyPdfData } = fetchedData;
 
     // Process XLS Files
     const processXlsData = async (data: any, metal: string) => {
       if (!data) return;
       const parsed = await parseXls(Buffer.from(data), metal);
+      results.parsed[`${metal.toLowerCase()}Xls`] = parsed.reportDate;
 
       // Calculate deltas vs previous row for same metal
       const prevResult = await pool.query(
@@ -628,11 +919,16 @@ async function startServer() {
     }
 
     // Process PDF Files
+    if (!pdfParse) {
+      results.errors.push({ file: 'pdf-parse', message: 'pdf-parse module not available — PDF data skipped, XLS data was still saved' });
+    }
+
     const processPdfData = async (data: any, filename: string) => {
-      if (!data) return;
+      if (!data || !pdfParse) return;
       const pdfData = await pdfParse(Buffer.from(data));
       const parsedData = parseCMEPdf(pdfData.text, filename);
       const reportDate = parsedData.business_date;
+      results.parsed[filename] = reportDate || 'NOT FOUND';
       if (!reportDate) {
         console.warn(`⚠️ No business date found in ${filename} — skipping DB write`);
         return;
@@ -740,7 +1036,7 @@ async function startServer() {
   // 4. Get Latest Delivery Notices
   app.get("/api/cme/latest-notices", async (req, res) => {
     try {
-      const metal = req.query.metal || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       let date = req.query.date as string | undefined;
       if (!date) {
         const dateResult = await pool.query(
@@ -764,7 +1060,7 @@ async function startServer() {
   // 2. Get Latest Stocks (History)
   app.get("/api/cme/latest-stocks", async (req, res) => {
     try {
-      const metal = req.query.metal || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       const result = await pool.query(
         "SELECT * FROM warehouse_stocks WHERE metal = $1 ORDER BY date ASC",
         [metal]
@@ -784,9 +1080,79 @@ async function startServer() {
     res.sendStatus(204);
   });
 
+  // ── Log viewer endpoints ───────────────────────────────────────────────────
+
+  // GET /api/logs/:type?lines=500  — return last N lines as JSON array
+  app.get("/api/logs/:type", (req, res) => {
+    const { type } = req.params;
+    const lines = Math.max(1, Math.min(parseInt(req.query.lines as string) || 500, 2000));
+    const logFile = type === 'frontend' ? FRONTEND_LOG : BACKEND_LOG;
+    try {
+      if (!fs.existsSync(logFile)) return res.json([]);
+      const content = fs.readFileSync(logFile, 'utf8');
+      const all = content.split('\n').filter(l => l.trim().length > 0);
+      res.json(all.slice(-lines));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/logs/:type/stream  — SSE real-time tail
+  app.get("/api/logs/:type/stream", (req, res) => {
+    const { type } = req.params;
+    const logFile = type === 'frontend' ? FRONTEND_LOG : BACKEND_LOG;
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    // Send last 100 lines immediately
+    let lastSize = 0;
+    try {
+      if (fs.existsSync(logFile)) {
+        const content = fs.readFileSync(logFile, 'utf8');
+        const lines = content.split('\n').filter(l => l.trim().length > 0).slice(-100);
+        lines.forEach(line => res.write(`data: ${JSON.stringify(line)}\n\n`));
+        lastSize = Buffer.byteLength(content, 'utf8');
+      }
+    } catch { /* ignore */ }
+
+    // Poll for new content every second
+    const interval = setInterval(() => {
+      try {
+        if (!fs.existsSync(logFile)) return;
+        const stat = fs.statSync(logFile);
+        const newSize = stat.size;
+        if (newSize <= lastSize) return;
+        const fd = fs.openSync(logFile, 'r');
+        const delta = Buffer.alloc(newSize - lastSize);
+        fs.readSync(fd, delta, 0, delta.length, lastSize);
+        fs.closeSync(fd);
+        lastSize = newSize;
+        const newLines = delta.toString('utf8').split('\n').filter(l => l.trim().length > 0);
+        newLines.forEach(line => res.write(`data: ${JSON.stringify(line)}\n\n`));
+      } catch { /* ignore read errors mid-write */ }
+    }, 1000);
+
+    req.on('close', () => clearInterval(interval));
+  });
+
+  // DELETE /api/logs/:type  — clear a log file
+  app.delete("/api/logs/:type", (req, res) => {
+    const { type } = req.params;
+    const logFile = type === 'frontend' ? FRONTEND_LOG : BACKEND_LOG;
+    try {
+      fs.writeFileSync(logFile, '');
+      res.json({ cleared: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.get("/api/history", async (req, res) => {
     try {
-      const metal = req.query.metal || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       const result = await pool.query(
         "SELECT * FROM warehouse_stocks WHERE metal = $1 ORDER BY date ASC",
         [metal]
@@ -800,7 +1166,7 @@ async function startServer() {
   // 7. Get Vault Breakdown
   app.get("/api/cme/vault-breakdown", async (req, res) => {
     try {
-      const metal = req.query.metal || 'GOLD';
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
       let date = req.query.date as string | undefined;
       if (!date) {
         const dateResult = await pool.query(
@@ -814,6 +1180,277 @@ async function startServer() {
         "SELECT * FROM vault_stocks WHERE date = $1 AND metal = $2 ORDER BY (registered_oz + eligible_oz) DESC",
         [date, metal]
       );
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── Institutional Trading Endpoints ──────────────────────────────────────────
+
+  // POST /api/cme/institutional/upload — accepts multipart PDF upload
+  app.post("/api/cme/institutional/upload", upload.single('pdf'), async (req: any, res: any) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: 'No PDF file provided. Use field name "pdf".' });
+      if (!pdfParse) return res.status(500).json({ error: 'pdf-parse module not loaded' });
+
+      const pdfData = await pdfParse(req.file.buffer);
+      const parsed = parseInstitutionalPdf(pdfData.text);
+
+      if (!parsed.reportDate) return res.status(422).json({ error: 'Could not extract report date from PDF.' });
+      if (parsed.firms.length === 0) return res.status(422).json({ error: 'No firm data found in PDF.' });
+
+      const client = await pool.connect();
+      let recordsInserted = 0;
+      try {
+        await client.query('BEGIN');
+
+        for (const firm of parsed.firms) {
+          const totalIssued = firm.customer_issued + firm.house_issued;
+          const totalStopped = firm.customer_stopped + firm.house_stopped;
+          const netPosition = totalStopped - totalIssued;
+          const isNetBuyer = netPosition > 0;
+
+          await client.query(`
+            INSERT INTO institutional_activity
+              (report_date, month, year, firm_code, firm_name, metal,
+               customer_issued, house_issued, total_issued,
+               customer_stopped, house_stopped, total_stopped,
+               net_position, is_net_buyer, source, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'CME YTD Report',NOW())
+            ON CONFLICT(report_date, month, year, firm_code, metal) DO UPDATE SET
+              firm_name = EXCLUDED.firm_name,
+              customer_issued = EXCLUDED.customer_issued,
+              house_issued = EXCLUDED.house_issued,
+              total_issued = EXCLUDED.total_issued,
+              customer_stopped = EXCLUDED.customer_stopped,
+              house_stopped = EXCLUDED.house_stopped,
+              total_stopped = EXCLUDED.total_stopped,
+              net_position = EXCLUDED.net_position,
+              is_net_buyer = EXCLUDED.is_net_buyer,
+              updated_at = NOW()
+          `, [
+            parsed.reportDate, parsed.month, parsed.year,
+            firm.firm_code, firm.firm_name, parsed.metal,
+            firm.customer_issued, firm.house_issued, totalIssued,
+            firm.customer_stopped, firm.house_stopped, totalStopped,
+            netPosition, isNetBuyer
+          ]);
+          recordsInserted++;
+        }
+
+        // Calculate and upsert daily summary
+        const totalIssued = parsed.firms.reduce((s, f) => s + f.customer_issued + f.house_issued, 0);
+        const totalStopped = parsed.firms.reduce((s, f) => s + f.customer_stopped + f.house_stopped, 0);
+        const totalCustomerIssued = parsed.firms.reduce((s, f) => s + f.customer_issued, 0);
+        const totalHouseIssued = parsed.firms.reduce((s, f) => s + f.house_issued, 0);
+        const totalCustomerStopped = parsed.firms.reduce((s, f) => s + f.customer_stopped, 0);
+        const totalHouseStopped = parsed.firms.reduce((s, f) => s + f.house_stopped, 0);
+        const netBuyers = parsed.firms.filter(f => (f.customer_stopped + f.house_stopped) > (f.customer_issued + f.house_issued));
+        const topBuyers = [...parsed.firms]
+          .map(f => ({ ...f, net: (f.customer_stopped + f.house_stopped) - (f.customer_issued + f.house_issued) }))
+          .sort((a, b) => b.net - a.net).slice(0, 10);
+        const topSellers = [...parsed.firms]
+          .map(f => ({ ...f, net: (f.customer_stopped + f.house_stopped) - (f.customer_issued + f.house_issued) }))
+          .sort((a, b) => a.net - b.net).slice(0, 10);
+
+        await client.query(`
+          INSERT INTO institutional_daily_summary
+            (report_date, month, year, metal, total_contracts, total_issued, total_stopped,
+             net_market_position, firms_count, net_buyers_count, net_sellers_count,
+             customer_issued_pct, house_issued_pct, customer_stopped_pct, house_stopped_pct,
+             top_buyers, top_sellers)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+          ON CONFLICT(report_date, metal) DO UPDATE SET
+            total_contracts = EXCLUDED.total_contracts,
+            total_issued = EXCLUDED.total_issued,
+            total_stopped = EXCLUDED.total_stopped,
+            net_market_position = EXCLUDED.net_market_position,
+            firms_count = EXCLUDED.firms_count,
+            net_buyers_count = EXCLUDED.net_buyers_count,
+            net_sellers_count = EXCLUDED.net_sellers_count,
+            customer_issued_pct = EXCLUDED.customer_issued_pct,
+            house_issued_pct = EXCLUDED.house_issued_pct,
+            customer_stopped_pct = EXCLUDED.customer_stopped_pct,
+            house_stopped_pct = EXCLUDED.house_stopped_pct,
+            top_buyers = EXCLUDED.top_buyers,
+            top_sellers = EXCLUDED.top_sellers
+        `, [
+          parsed.reportDate, parsed.month, parsed.year, parsed.metal,
+          totalIssued + totalStopped, totalIssued, totalStopped,
+          totalStopped - totalIssued,
+          parsed.firms.length, netBuyers.length, parsed.firms.length - netBuyers.length,
+          totalIssued > 0 ? +((totalCustomerIssued / totalIssued) * 100).toFixed(2) : null,
+          totalIssued > 0 ? +((totalHouseIssued / totalIssued) * 100).toFixed(2) : null,
+          totalStopped > 0 ? +((totalCustomerStopped / totalStopped) * 100).toFixed(2) : null,
+          totalStopped > 0 ? +((totalHouseStopped / totalStopped) * 100).toFixed(2) : null,
+          JSON.stringify(topBuyers), JSON.stringify(topSellers)
+        ]);
+
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+
+      res.json({
+        success: true,
+        recordsInserted,
+        date: parsed.reportDate,
+        month: parsed.month,
+        year: parsed.year,
+        metal: parsed.metal,
+        summary: {
+          totalFirms: parsed.firms.length,
+          totalIssued: parsed.firms.reduce((s, f) => s + f.customer_issued + f.house_issued, 0),
+          totalStopped: parsed.firms.reduce((s, f) => s + f.customer_stopped + f.house_stopped, 0),
+        }
+      });
+    } catch (error: any) {
+      console.error('❌ Institutional upload error:', error.message);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/latest
+  app.get("/api/cme/institutional/latest", async (req, res) => {
+    try {
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
+      const dateResult = await pool.query(
+        "SELECT report_date FROM institutional_activity WHERE metal = $1 ORDER BY report_date DESC LIMIT 1",
+        [metal]
+      );
+      if (!dateResult.rows[0]) return res.json({ data: [], summary: null });
+
+      const date = dateResult.rows[0].report_date;
+      const [activity, summary] = await Promise.all([
+        pool.query(
+          "SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2 ORDER BY net_position DESC",
+          [date, metal]
+        ),
+        pool.query(
+          "SELECT * FROM institutional_daily_summary WHERE report_date = $1 AND metal = $2",
+          [date, metal]
+        )
+      ]);
+
+      res.json({ data: activity.rows, summary: summary.rows[0] || null, date });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/top-traders?date=&limit=10&metal=GOLD
+  app.get("/api/cme/institutional/top-traders", async (req, res) => {
+    try {
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
+      const limit = Math.max(1, Math.min(parseInt(req.query.limit as string) || 10, 50));
+      let date = req.query.date as string;
+
+      if (!date) {
+        const r = await pool.query(
+          "SELECT report_date FROM institutional_activity WHERE metal = $1 ORDER BY report_date DESC LIMIT 1",
+          [metal]
+        );
+        date = r.rows[0]?.report_date;
+      }
+      if (!date) return res.json({ buyers: [], sellers: [], date: null });
+
+      const [buyers, sellers] = await Promise.all([
+        pool.query(
+          "SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2 ORDER BY net_position DESC LIMIT $3",
+          [date, metal, limit]
+        ),
+        pool.query(
+          "SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2 ORDER BY net_position ASC LIMIT $3",
+          [date, metal, limit]
+        )
+      ]);
+
+      res.json({ buyers: buyers.rows, sellers: sellers.rows, date });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/firm/:firmName?days=30&metal=GOLD
+  app.get("/api/cme/institutional/firm/:firmName", async (req, res) => {
+    try {
+      const { firmName } = req.params;
+      const METALS = ['GOLD', 'SILVER'];
+      const metal = METALS.includes((req.query.metal as string)?.toUpperCase())
+        ? (req.query.metal as string).toUpperCase() : 'GOLD';
+      const days = Math.max(1, Math.min(parseInt(req.query.days as string) || 30, 365));
+
+      const result = await pool.query(
+        `SELECT * FROM institutional_activity
+         WHERE (firm_name ILIKE $1 OR firm_code = $2) AND metal = $3
+           AND report_date >= (CURRENT_DATE - ($4 * INTERVAL '1 day'))::TEXT
+         ORDER BY report_date DESC`,
+        [`%${firmName}%`, firmName, metal, days]
+      );
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/compare?date1=&date2=&metal=GOLD
+  app.get("/api/cme/institutional/compare", async (req, res) => {
+    try {
+      const { date1, date2 } = req.query as { date1: string; date2: string };
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
+      if (!date1 || !date2) return res.status(400).json({ error: 'date1 and date2 are required' });
+
+      const [r1, r2] = await Promise.all([
+        pool.query("SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2", [date1, metal]),
+        pool.query("SELECT * FROM institutional_activity WHERE report_date = $1 AND metal = $2", [date2, metal])
+      ]);
+
+      const map1: Record<string, any> = {};
+      const map2: Record<string, any> = {};
+      r1.rows.forEach((r: any) => { map1[r.firm_code] = r; });
+      r2.rows.forEach((r: any) => { map2[r.firm_code] = r; });
+
+      const allCodes = new Set([...Object.keys(map1), ...Object.keys(map2)]);
+      const comparison = Array.from(allCodes).map(code => {
+        const a = map1[code];
+        const b = map2[code];
+        const posA = a?.net_position ?? 0;
+        const posB = b?.net_position ?? 0;
+        return {
+          firm_code: code,
+          firm_name: a?.firm_name || b?.firm_name,
+          date1_net: posA,
+          date2_net: posB,
+          change: posA - posB,
+          trend: posA > posB ? 'increasing_buy' : posA < posB ? 'increasing_sell' : 'unchanged',
+          is_new: !b,
+          is_exited: !a
+        };
+      }).sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
+
+      res.json({ comparison, date1, date2, metal });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/cme/institutional/summary?startDate=&endDate=&metal=GOLD
+  app.get("/api/cme/institutional/summary", async (req, res) => {
+    try {
+      const { startDate, endDate } = req.query as { startDate: string; endDate: string };
+      const metal = ['GOLD','SILVER'].includes((req.query.metal as string)?.toUpperCase()) ? (req.query.metal as string).toUpperCase() : 'GOLD';
+
+      let query = "SELECT * FROM institutional_daily_summary WHERE metal = $1";
+      const params: any[] = [metal];
+      if (startDate) { query += ` AND report_date >= $${params.length + 1}`; params.push(startDate); }
+      if (endDate)   { query += ` AND report_date <= $${params.length + 1}`; params.push(endDate); }
+      query += " ORDER BY report_date DESC LIMIT 90";
+
+      const result = await pool.query(query, params);
       res.json(result.rows);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -840,24 +1477,16 @@ async function startServer() {
     });
   }
 
+  // Global error handler — catches errors passed via next(err) or thrown in async middleware
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    console.error(`[error] Unhandled: ${err?.message ?? err}`);
+    const status = typeof err?.status === 'number' ? err.status : 500;
+    res.status(status).json({ error: err?.message ?? 'Internal server error' });
+  });
+
   app.listen(PORT, "0.0.0.0", async () => {
     console.log(`Server running on http://localhost:${PORT}`);
 
-    // BUG 4: Restore lost March 16 data
-    try {
-      const existsResult = await pool.query(
-        "SELECT 1 FROM warehouse_stocks WHERE date = '2026-03-16' AND metal = 'GOLD'"
-      );
-      if (existsResult.rows.length === 0) {
-        await pool.query(`
-          INSERT INTO warehouse_stocks (date, metal, registered_oz, eligible_oz, total_oz, daily_change_registered, daily_change_eligible, created_at)
-          VALUES ('2026-03-16', 'GOLD', 16695520, 15856042, 32551562, 0, 0, '2026-03-16 14:28:34')
-        `);
-        console.log("✅ Restored March 16 data point.");
-      }
-    } catch (e) {
-      console.error("Failed to restore March 16 data:", e);
-    }
   });
 }
 
