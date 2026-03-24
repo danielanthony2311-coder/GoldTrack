@@ -677,53 +677,142 @@ async function startServer() {
     const results: any = {
       success: true,
       files: {},
-      parsed: {},   // date extracted per file
+      parsed: {},
       errors: []
     };
 
+    // ── Human-like helpers ────────────────────────────────────────────────────
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+    // Random delay in [minMs, maxMs] with gaussian-ish distribution (average of 3 randoms)
+    const humanDelay = (minMs: number, maxMs: number) => {
+      const r = (Math.random() + Math.random() + Math.random()) / 3; // bell-curve [0,1]
+      return sleep(Math.round(minMs + r * (maxMs - minMs)));
+    };
+
+    // Pick a consistent UA for this session (Chrome on Windows, latest-ish build)
     const UA_LIST = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
     ];
-    const fetchFile = async (name: string, url: string, type: 'arraybuffer') => {
-      for (let attempt = 0; attempt < UA_LIST.length; attempt++) {
+    const sessionUA = UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
+
+    // ── Step 1: Visit the landing page first (harvests cookies + looks natural) ─
+    let sessionCookies = '';
+    try {
+      console.log('🌐 [sync] Visiting CME delivery reports landing page…');
+      const landingRes = await axios.get('https://www.cmegroup.com/delivery_reports/', {
+        timeout: 20000,
+        headers: {
+          'User-Agent': sessionUA,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-User': '?1',
+          'Cache-Control': 'max-age=0',
+        },
+        maxRedirects: 5,
+      });
+      // Harvest all Set-Cookie values into a single Cookie header string
+      const setCookieHeader = landingRes.headers['set-cookie'];
+      if (setCookieHeader) {
+        sessionCookies = (Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader])
+          .map(c => c.split(';')[0].trim())
+          .filter(Boolean)
+          .join('; ');
+        console.log(`🍪 [sync] Harvested ${setCookieHeader.length} cookie(s) from landing page`);
+      }
+    } catch (err: any) {
+      console.warn(`⚠️ [sync] Landing page visit failed (non-fatal): ${err.message}`);
+    }
+
+    // Simulate page-load reading time before the user "clicks" a download link
+    await humanDelay(3000, 6000);
+
+    // ── Step 2: Fetch each file sequentially with inter-request human delays ──
+    const fetchFile = async (name: string, url: string) => {
+      for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          console.log(`🔄 Fetching ${name} (attempt ${attempt + 1}) from: ${url}`);
+          console.log(`🔄 [sync] Fetching ${name} (attempt ${attempt + 1})…`);
+          const headers: Record<string, string> = {
+            'User-Agent': sessionUA,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Referer': 'https://www.cmegroup.com/delivery_reports/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+          };
+          if (sessionCookies) headers['Cookie'] = sessionCookies;
+
           const response = await axios.get(url, {
-            responseType: type,
+            responseType: 'arraybuffer',
             timeout: 30000,
-            headers: {
-              'User-Agent': UA_LIST[attempt],
-              'Accept': '*/*',
-              'Accept-Language': 'en-US,en;q=0.9',
-              'Referer': 'https://www.cmegroup.com/',
-            }
+            headers,
+            maxRedirects: 5,
           });
+
+          // Merge any new cookies from this response
+          const newCookies = response.headers['set-cookie'];
+          if (newCookies) {
+            const merged = new Map<string, string>();
+            // Existing cookies
+            sessionCookies.split('; ').filter(Boolean).forEach(c => {
+              const [k, v] = c.split('=');
+              if (k) merged.set(k.trim(), v ?? '');
+            });
+            // New cookies override
+            (Array.isArray(newCookies) ? newCookies : [newCookies]).forEach(c => {
+              const part = c.split(';')[0].trim();
+              const [k, v] = part.split('=');
+              if (k) merged.set(k.trim(), v ?? '');
+            });
+            sessionCookies = [...merged.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+          }
+
           results.files[name] = { status: response.status };
+          console.log(`✅ [sync] ${name} fetched (${Math.round(response.data.byteLength / 1024)} KB)`);
           return response.data;
         } catch (error: any) {
           const status = error.response?.status || 'FETCH_ERROR';
-          if (status === 403 && attempt < UA_LIST.length - 1) {
-            console.warn(`⚠️ ${name} got 403, retrying with different UA…`);
-            await new Promise(r => setTimeout(r, 1500));
+          if (attempt < 2) {
+            console.warn(`⚠️ [sync] ${name} got ${status}, waiting before retry…`);
+            await humanDelay(4000, 9000); // longer back-off on failure
             continue;
           }
           results.errors.push({ file: name, url, status, message: error.message });
-          console.error(`❌ Error fetching ${name}: ${error.message}`);
+          console.error(`❌ [sync] Failed to fetch ${name}: ${error.message}`);
           return null;
         }
       }
       return null;
     };
 
-    // Fetch all files
-    const [goldXlsData, silverXlsData, mtdPdfData, dailyPdfData] = await Promise.all([
-      fetchFile('goldXls', urls.goldXls, 'arraybuffer'),
-      fetchFile('silverXls', urls.silverXls, 'arraybuffer'),
-      fetchFile('mtdPdf', urls.mtdPdf, 'arraybuffer'),
-      fetchFile('dailyPdf', urls.dailyPdf, 'arraybuffer')
-    ]);
+    // Sequential fetches with human-paced delays between each one
+    const fileOrder: [string, string][] = [
+      ['goldXls',   urls.goldXls],
+      ['silverXls', urls.silverXls],
+      ['mtdPdf',    urls.mtdPdf],
+      ['dailyPdf',  urls.dailyPdf],
+    ];
+    const fetchedData: Record<string, any> = {};
+    for (const [name, url] of fileOrder) {
+      fetchedData[name] = await fetchFile(name, url);
+      if (name !== fileOrder[fileOrder.length - 1][0]) {
+        // 3–8 seconds between downloads (like a human clicking each link)
+        await humanDelay(3000, 8000);
+      }
+    }
+    const { goldXls: goldXlsData, silverXls: silverXlsData, mtdPdf: mtdPdfData, dailyPdf: dailyPdfData } = fetchedData;
 
     // Process XLS Files
     const processXlsData = async (data: any, metal: string) => {
