@@ -23,22 +23,18 @@ const upload = multer({
   },
 });
 
-// pdf-parse: try direct lib path first (avoids test-file read bug in some versions), then fall back
-let pdfParse: ((buf: Buffer, opts?: any) => Promise<{ text: string }>) | null = null;
+// pdf-parse v2: PDFParse class — new PDFParse({ data: buffer }).getText()
+let PDFParseClass: (new (opts: { data: Buffer }) => { getText: () => Promise<{ text: string }> }) | null = null;
 try {
-  const raw = require('pdf-parse/lib/pdf-parse.js');
-  pdfParse = typeof raw === 'function' ? raw : raw?.default ?? null;
-} catch {
-  try {
-    const raw = require('pdf-parse');
-    pdfParse = typeof raw === 'function' ? raw
-      : typeof raw?.default === 'function' ? raw.default
-      : typeof raw?.parse === 'function' ? raw.parse
-      : null;
-  } catch (e: any) {
-    console.error('⚠️  pdf-parse failed to load:', e.message);
-  }
+  const raw = require('pdf-parse');
+  PDFParseClass = raw?.PDFParse ?? null;
+} catch (e: any) {
+  console.error('⚠️  pdf-parse failed to load:', e.message);
 }
+// Wrap into the same async (buf) => { text } signature used throughout
+const pdfParse = PDFParseClass
+  ? (buf: Buffer) => new PDFParseClass!({ data: buf }).getText()
+  : null;
 console.log(`[startup] pdf-parse loaded: ${pdfParse !== null}`);
 
 const __filename = fileURLToPath(import.meta.url);
