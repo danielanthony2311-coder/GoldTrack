@@ -969,6 +969,76 @@ async function startServer() {
     res.sendStatus(204);
   });
 
+  // ── Log viewer endpoints ───────────────────────────────────────────────────
+
+  // GET /api/logs/:type?lines=500  — return last N lines as JSON array
+  app.get("/api/logs/:type", (req, res) => {
+    const { type } = req.params;
+    const lines = Math.min(parseInt(req.query.lines as string) || 500, 2000);
+    const logFile = type === 'frontend' ? FRONTEND_LOG : BACKEND_LOG;
+    try {
+      if (!fs.existsSync(logFile)) return res.json([]);
+      const content = fs.readFileSync(logFile, 'utf8');
+      const all = content.split('\n').filter(l => l.trim().length > 0);
+      res.json(all.slice(-lines));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/logs/:type/stream  — SSE real-time tail
+  app.get("/api/logs/:type/stream", (req, res) => {
+    const { type } = req.params;
+    const logFile = type === 'frontend' ? FRONTEND_LOG : BACKEND_LOG;
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    // Send last 100 lines immediately
+    let lastSize = 0;
+    try {
+      if (fs.existsSync(logFile)) {
+        const content = fs.readFileSync(logFile, 'utf8');
+        const lines = content.split('\n').filter(l => l.trim().length > 0).slice(-100);
+        lines.forEach(line => res.write(`data: ${JSON.stringify(line)}\n\n`));
+        lastSize = Buffer.byteLength(content, 'utf8');
+      }
+    } catch { /* ignore */ }
+
+    // Poll for new content every second
+    const interval = setInterval(() => {
+      try {
+        if (!fs.existsSync(logFile)) return;
+        const stat = fs.statSync(logFile);
+        const newSize = stat.size;
+        if (newSize <= lastSize) return;
+        const fd = fs.openSync(logFile, 'r');
+        const delta = Buffer.alloc(newSize - lastSize);
+        fs.readSync(fd, delta, 0, delta.length, lastSize);
+        fs.closeSync(fd);
+        lastSize = newSize;
+        const newLines = delta.toString('utf8').split('\n').filter(l => l.trim().length > 0);
+        newLines.forEach(line => res.write(`data: ${JSON.stringify(line)}\n\n`));
+      } catch { /* ignore read errors mid-write */ }
+    }, 1000);
+
+    req.on('close', () => clearInterval(interval));
+  });
+
+  // DELETE /api/logs/:type  — clear a log file
+  app.delete("/api/logs/:type", (req, res) => {
+    const { type } = req.params;
+    const logFile = type === 'frontend' ? FRONTEND_LOG : BACKEND_LOG;
+    try {
+      fs.writeFileSync(logFile, '');
+      res.json({ cleared: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.get("/api/history", async (req, res) => {
     try {
       const metal = req.query.metal || 'GOLD';
