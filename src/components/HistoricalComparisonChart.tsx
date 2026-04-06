@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   BarChart,
   Bar,
@@ -14,23 +14,25 @@ import { ChevronDown } from 'lucide-react';
 import { cn } from '../utils/cn';
 
 const HISTORICAL_DATA: any = {
-  "averages": { 
-    "Jan": 11663, "Feb": 25759, "Mar": 12015, "Apr": 11088, "May": 17535, 
-    "Jun": 8663, "Jul": 10838, "Aug": 12950, "Sep": 12225, "Oct": 12525, 
-    "Nov": 13650, "Dec": 16550 
+  "averages": {
+    "Jan": 11663, "Feb": 25759, "Mar": 12015, "Apr": 11088, "May": 17535,
+    "Jun": 8663, "Jul": 10838, "Aug": 12950, "Sep": 12225, "Oct": 12525,
+    "Nov": 13650, "Dec": 16550
   },
   "years": {
     "2021": { "Jan": 4600, "Feb": 4100, "Mar": 4750, "Apr": 4050, "May": 3800, "Jun": 4300, "Jul": 3900, "Aug": 4550, "Sep": 4250, "Oct": 4150, "Nov": 4450, "Dec": 5000 },
     "2022": { "Jan": 4550, "Feb": 4250, "Mar": 4850, "Apr": 4150, "May": 4000, "Jun": 4450, "Jul": 4050, "Aug": 4650, "Sep": 4350, "Oct": 4250, "Nov": 4550, "Dec": 5200 },
     "2024": { "Jan": 13500, "Feb": 18118, "Mar": 15360, "Apr": 14350, "May": 37050, "Jun": 4400, "Jul": 12000, "Aug": 18400, "Sep": 16500, "Oct": 17200, "Nov": 19500, "Dec": 25000 },
-    "2025": { 
-      "Jan": 24000, 
-      "Feb": 76567, 
-      "Mar": 23100, "Apr": 21800, "May": 25291, "Jun": 21500, "Jul": 23400, "Aug": 24200, "Sep": 23800, "Oct": 24500, "Nov": 26100, "Dec": 31000 
+    "2025": {
+      "Jan": 24000,
+      "Feb": 76567,
+      "Mar": 23100, "Apr": 21800, "May": 25291, "Jun": 21500, "Jul": 23400, "Aug": 24200, "Sep": 23800, "Oct": 24500, "Nov": 26100, "Dec": 37098
     },
-    "2026": { "Jan": 28500, "Feb": 40711, "Mar": null, "Apr": null, "May": null, "Jun": null, "Jul": null, "Aug": null, "Sep": null, "Oct": null, "Nov": null, "Dec": null }
+    "2026": { "Jan": 11862, "Feb": 40711, "Mar": 14559, "Apr": null, "May": null, "Jun": null, "Jul": null, "Aug": null, "Sep": null, "Oct": null, "Nov": null, "Dec": null }
   }
 };
+
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 const ALL_TIME_HIGH = 76567;
 
@@ -81,17 +83,71 @@ const CustomTooltip = ({ active, payload, label, year }: any) => {
 
 export default function HistoricalComparisonChart() {
   const [selectedYear, setSelectedYear] = useState('2026');
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const [liveMtd, setLiveMtd] = useState<Record<string, number>>({});
+
+  // Fetch live YTD + MTD data from the API
+  useEffect(() => {
+    const controller = new AbortController();
+    const YTD_MONTH_MAP: Record<string, string> = {
+      PREV_DEC: "Dec", JAN: "Jan", FEB: "Feb", MAR: "Mar", APR: "Apr",
+      MAY: "May", JUN: "Jun", JUL: "Jul", AUG: "Aug", SEP: "Sep", OCT: "Oct", NOV: "Nov", DEC: "Dec"
+    };
+
+    // Try YTD first (has full monthly breakdown), fall back to MTD for current month
+    Promise.all([
+      fetch('/api/cme/summary?metal=GOLD&type=YTD', { signal: controller.signal }).then(r => r.ok ? r.json() : []),
+      fetch('/api/cme/summary?metal=GOLD&type=MTD', { signal: controller.signal }).then(r => r.ok ? r.json() : [])
+    ]).then(([ytdRows, mtdRows]: [any[], any[]]) => {
+      const byMonth: Record<string, number> = {};
+
+      // YTD data: get the latest row's ytd_by_month
+      const sortedYtd = ytdRows.sort((a: any, b: any) => b.date.localeCompare(a.date));
+      if (sortedYtd.length > 0 && sortedYtd[0].ytd_json) {
+        try {
+          const ytdMonths = JSON.parse(sortedYtd[0].ytd_json);
+          for (const [key, val] of Object.entries(ytdMonths)) {
+            const monthName = YTD_MONTH_MAP[key];
+            if (monthName && key !== "PREV_DEC") {
+              byMonth[monthName] = val as number;
+            }
+          }
+        } catch {}
+      }
+
+      // MTD data: get current month's latest cumulative (fills in live data)
+      for (const row of mtdRows) {
+        const d = new Date(row.date);
+        const monthKey = MONTH_NAMES[d.getUTCMonth()];
+        const val = Number(row.mtd) || 0;
+        if (val > (byMonth[monthKey] || 0)) {
+          byMonth[monthKey] = val;
+        }
+      }
+
+      setLiveMtd(byMonth);
+    }).catch(() => {});
+    return () => controller.abort();
+  }, []);
 
   const chartData = useMemo(() => {
-    return months
+    // Merge live MTD into 2026 data
+    const yearData = { ...HISTORICAL_DATA.years[selectedYear] };
+    if (selectedYear === '2026') {
+      for (const [month, val] of Object.entries(liveMtd)) {
+        if (val && (yearData[month] === null || yearData[month] === undefined)) {
+          yearData[month] = val;
+        }
+      }
+    }
+
+    return MONTH_NAMES
       .map(month => ({
         name: month,
-        yearValue: HISTORICAL_DATA.years[selectedYear][month],
+        yearValue: yearData[month],
         averageValue: HISTORICAL_DATA.averages[month]
       }))
       .filter(item => item.yearValue !== null && item.yearValue !== undefined && item.yearValue !== 0);
-  }, [selectedYear]);
+  }, [selectedYear, liveMtd]);
 
   return (
     <div className="glass-card p-6 bg-[#121212] border-[#333] rounded-2xl w-full">

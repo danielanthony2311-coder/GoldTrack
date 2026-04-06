@@ -37,6 +37,150 @@ const pdfParse = PDFParseClass
   : null;
 console.log(`[startup] pdf-parse loaded: ${pdfParse !== null}`);
 
+// pdfjs-dist for layout-aware parsing (delivery notices need column positions)
+let pdfjsLib: any = null;
+try {
+  pdfjsLib = require('pdfjs-dist/legacy/build/pdf.mjs');
+} catch (e: any) {
+  console.warn('⚠️  pdfjs-dist not available for layout parsing:', e.message);
+}
+
+// Parse CME Daily Delivery PDF using pdfjs-dist with column position awareness
+// This correctly assigns numbers to ISSUED vs STOPPED columns
+async function parseDailyPdfWithLayout(pdfBuffer: Buffer) {
+  if (!pdfjsLib) return null;
+
+  const data = new Uint8Array(pdfBuffer);
+  const doc = await pdfjsLib.getDocument({ data }).promise;
+  const numPages = doc.numPages;
+
+  let businessDate = '';
+  const metals: Record<string, { settlement: number; daily_issued: number; daily_stopped: number; all_firms: any[] }> = {};
+  let currentMetal = '';
+  let currentFirms: any[] = [];
+
+  // Column threshold: ISSUED col centers around x=320-345, STOPPED around x=378-410
+  // Numbers at x < 370 are ISSUED, x >= 370 are STOPPED
+  const STOPPED_COL_THRESHOLD = 370;
+
+  for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+    const page = await doc.getPage(pageNum);
+    const content = await page.getTextContent();
+
+    // Group text items by Y position
+    const lineMap: Record<number, { x: number; text: string }[]> = {};
+    content.items.forEach((item: any) => {
+      if (!item.str || !item.str.trim()) return;
+      const y = Math.round(item.transform[5]);
+      const x = Math.round(item.transform[4]);
+      if (!lineMap[y]) lineMap[y] = [];
+      lineMap[y].push({ x, text: item.str.trim() });
+    });
+
+    // Process lines top-to-bottom (higher Y = higher on page in PDF coords)
+    const sortedYs = Object.keys(lineMap).map(Number).sort((a, b) => b - a);
+
+    for (const y of sortedYs) {
+      const items = lineMap[y].sort((a, b) => a.x - b.x);
+      const lineText = items.map(i => i.text).join(' ');
+
+      // Extract business date
+      if (lineText.includes('BUSINESS DATE:')) {
+        const match = lineText.match(/BUSINESS DATE:\s*(\d{1,2}\/\d{1,2}\/\d{4})/);
+        if (match) {
+          const [m, d, yr] = match[1].split('/');
+          businessDate = `${yr}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+        }
+      }
+
+      // Detect metal section
+      if (lineText.includes('COMEX 100 GOLD FUTURES')) {
+        currentMetal = 'GOLD';
+        currentFirms = [];
+      } else if (lineText.includes('COMEX 5000 SILVER FUTURES')) {
+        currentMetal = 'SILVER';
+        currentFirms = [];
+      } else if (currentMetal && lineText.includes('CONTRACT:') && !lineText.includes(currentMetal)) {
+        // Different contract — save current metal and reset
+        if (currentFirms.length > 0) {
+          if (!metals[currentMetal]) metals[currentMetal] = { settlement: 0, daily_issued: 0, daily_stopped: 0, all_firms: [] };
+          metals[currentMetal].all_firms.push(...currentFirms);
+        }
+        currentMetal = '';
+        currentFirms = [];
+      }
+
+      if (!currentMetal) continue;
+
+      // Extract settlement
+      if (lineText.includes('SETTLEMENT:')) {
+        const match = lineText.match(/SETTLEMENT:\s*([\d,.]+)/);
+        if (match) {
+          metals[currentMetal] = metals[currentMetal] || { settlement: 0, daily_issued: 0, daily_stopped: 0, all_firms: [] };
+          metals[currentMetal].settlement = parseFloat(match[1].replace(/,/g, ''));
+        }
+      }
+
+      // Extract TOTAL line
+      if (lineText.includes('TOTAL:') && !lineText.includes('MONTH')) {
+        const nums = lineText.match(/TOTAL:\s*([\d,]+)\s+([\d,]+)/);
+        if (nums && metals[currentMetal]) {
+          metals[currentMetal].daily_issued = parseInt(nums[1].replace(/,/g, ''), 10);
+          metals[currentMetal].daily_stopped = parseInt(nums[2].replace(/,/g, ''), 10);
+        }
+        // Save firms for this metal
+        if (currentFirms.length > 0) {
+          if (!metals[currentMetal]) metals[currentMetal] = { settlement: 0, daily_issued: 0, daily_stopped: 0, all_firms: [] };
+          metals[currentMetal].all_firms.push(...currentFirms);
+        }
+        currentFirms = [];
+      }
+
+      // Parse firm rows using positional data
+      const firstItem = items[0];
+      if (firstItem && firstItem.text.match(/^\d{3}$/)) {
+        const firmNbr = firstItem.text;
+        const orgItem = items.find(i => i.text === 'C' || i.text === 'H');
+        if (!orgItem) continue;
+        const org = orgItem.text;
+
+        // Get firm name items (between org and numbers)
+        const nameItems = items.filter(i => i.x > orgItem.x && i.x < 300 && !i.text.match(/^\d[\d,]*$/));
+        const firmName = nameItems.map(i => i.text).join(' ');
+
+        // Get number items (x >= 300) and assign to issued/stopped based on x position
+        const numberItems = items.filter(i => i.x >= 300 && i.text.match(/^[\d,]+$/));
+        let issued = 0;
+        let stopped = 0;
+
+        for (const numItem of numberItems) {
+          const val = parseInt(numItem.text.replace(/,/g, ''), 10);
+          if (isNaN(val)) continue;
+          if (numItem.x >= STOPPED_COL_THRESHOLD) {
+            stopped += val;
+          } else {
+            issued += val;
+          }
+        }
+
+        if (issued > 0 || stopped > 0) {
+          currentFirms.push({ firm: firmName, issued, stopped, org });
+        }
+      }
+    }
+  }
+
+  // Handle any remaining metal section
+  if (currentMetal && currentFirms.length > 0) {
+    if (!metals[currentMetal]) metals[currentMetal] = { settlement: 0, daily_issued: 0, daily_stopped: 0, all_firms: [] };
+    metals[currentMetal].all_firms.push(...currentFirms);
+  }
+
+  await doc.destroy();
+
+  return { business_date: businessDate, metals };
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -389,8 +533,9 @@ function processSection(lines: string[], type: string, metal: string) {
       }
     }
   } else if (type === "DAILY") {
-    let allFirms: any[] = [];
-    let firmTotals: Record<string, { issued: number, stopped: number }> = {};
+    let firmTotals: Record<string, { issued: number, stopped: number, org: string }> = {};
+
+    console.log(`🔍 DAILY section for ${metal}: ${lines.length} lines`);
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
@@ -411,49 +556,44 @@ function processSection(lines: string[], type: string, metal: string) {
         const org = firmMatch[2];
         const rest = firmMatch[3];
 
-        // The numbers are at the end. Issued is 4th col, Stopped is 5th.
-        // Pattern: [FIRM_NAME] [ISSUED] [STOPPED]
-        // Some might be blank.
-        const parts = rest.trim().split(/\s{2,}/);
-        let firmName = parts[0];
+        // Extract numbers from the end of the rest string
+        // Format: "FIRM NAME 123 456" or "FIRM NAME 123" (issued only or stopped only)
+        const safeInt = (s: string) => { const n = parseInt(s.replace(/,/g, ''), 10); return isNaN(n) ? 0 : n; };
+        let firmName = rest.trim();
         let issued = 0;
         let stopped = 0;
 
-        const safeInt = (s: string) => { const n = parseInt(s.replace(/,/g, ''), 10); return isNaN(n) ? 0 : n; };
-        if (parts.length === 3) {
-          issued = safeInt(parts[1]);
-          stopped = safeInt(parts[2]);
-        } else if (parts.length === 2) {
-          // Check position to see if it's issued or stopped
-          // This is tricky without fixed width. Let's try a different approach.
-          const numbersMatch = rest.match(/(\d[\d,]*)\s*(\d[\d,]*)?\s*$/);
-          if (numbersMatch) {
-            const num1 = numbersMatch[1];
-            const num2 = numbersMatch[2];
-            const pos1 = rest.lastIndexOf(num1);
-            if (num2) {
-              issued = safeInt(num1);
-              stopped = safeInt(num2);
-            } else {
-              // If only one number, check its relative position in the line
-              if (pos1 > 40) { // Arbitrary threshold for "Stopped" column
-                stopped = safeInt(num1);
-              } else {
-                issued = safeInt(num1);
-              }
-            }
+        // Match one or two numbers at the end of the string
+        const numbersAtEnd = rest.match(/^(.+?)\s+([\d,]+)\s+([\d,]+)\s*$/);
+        const oneNumberAtEnd = rest.match(/^(.+?)\s+([\d,]+)\s*$/);
+
+        if (numbersAtEnd) {
+          // Two numbers: issued and stopped
+          firmName = numbersAtEnd[1].trim();
+          issued = safeInt(numbersAtEnd[2]);
+          stopped = safeInt(numbersAtEnd[3]);
+        } else if (oneNumberAtEnd) {
+          // One number: could be issued or stopped
+          // CME convention: if only one number, it's in the "stopped" column (buyers)
+          // unless context says otherwise. We check the original line position.
+          firmName = oneNumberAtEnd[1].trim();
+          const num = safeInt(oneNumberAtEnd[2]);
+          // Use the full original line to check column position
+          const numPos = line.lastIndexOf(oneNumberAtEnd[2]);
+          if (numPos > 50) {
+            stopped = num;
+          } else {
+            issued = num;
           }
         }
 
-        // Clean firm name
-        firmName = firmName.replace(/[\d,.\s]+$/, '').trim();
-
         if (issued > 0 || stopped > 0) {
-          if (!firmTotals[firmName]) {
-            firmTotals[firmName] = { issued: 0, stopped: 0 };
+          const key = `${firmName}||${org}`;
+          if (!firmTotals[key]) {
+            firmTotals[key] = { issued: 0, stopped: 0, org };
           }
-          firmTotals[firmName].issued += issued;
-          firmTotals[firmName].stopped += stopped;
+          firmTotals[key].issued += issued;
+          firmTotals[key].stopped += stopped;
         }
       }
 
@@ -469,10 +609,38 @@ function processSection(lines: string[], type: string, metal: string) {
       }
     }
 
-    result.all_firms = Object.entries(firmTotals).map(([name, totals]) => ({
-      firm: name,
+    result.all_firms = Object.entries(firmTotals).map(([key, totals]) => ({
+      firm: key.split('||')[0],
       ...totals
     }));
+    if (result.all_firms.length === 0) {
+      console.warn(`⚠️ DAILY report parsed but no firm rows matched for ${metal}`);
+    }
+  } else if (type === "YTD") {
+    // Extract monthly totals from the TOTALS row
+    // Format: TOTALS: | 37098 | 11862 | 40711 | 14559 | 15333 | | | | | | | | |
+    // Columns: PREV DEC | JAN | FEB | MAR | APR | MAY | JUN | JUL | AUG | SEP | OCT | NOV | DEC
+    const monthKeys = ["PREV_DEC", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
+    for (const line of lines) {
+      if (line.trim().toUpperCase().startsWith("TOTALS:")) {
+        // Split by pipe delimiter and extract numbers
+        const parts = line.split('|').map(p => p.trim());
+        // First part is "TOTALS:" — skip it, then each pipe-delimited cell is a month
+        const ytd_by_month: Record<string, number> = {};
+        for (let j = 1; j < parts.length && j - 1 < monthKeys.length; j++) {
+          const val = parseInt(parts[j].replace(/,/g, ''), 10);
+          if (!isNaN(val) && val > 0) {
+            ytd_by_month[monthKeys[j - 1]] = val;
+          }
+        }
+        if (Object.keys(ytd_by_month).length > 0) {
+          result.ytd_by_month = ytd_by_month;
+          console.log(`📊 YTD ${metal} monthly totals:`, ytd_by_month);
+        }
+        break;
+      }
+    }
   }
 
   return result;
@@ -689,7 +857,8 @@ async function startServer() {
       goldXls: "https://www.cmegroup.com/delivery_reports/Gold_Stocks.xls",
       silverXls: "https://www.cmegroup.com/delivery_reports/Silver_stocks.xls",
       mtdPdf: "https://www.cmegroup.com/delivery_reports/MetalsIssuesAndStopsMTDReport.pdf",
-      dailyPdf: "https://www.cmegroup.com/delivery_reports/MetalsIssuesAndStopsReport.pdf"
+      dailyPdf: "https://www.cmegroup.com/delivery_reports/MetalsIssuesAndStopsReport.pdf",
+      ytdPdf: "https://www.cmegroup.com/delivery_reports/MetalsIssuesAndStopsYTDReport.pdf"
     };
 
     const results: any = {
@@ -849,6 +1018,7 @@ async function startServer() {
       ['silverXls', [discoveredSilverXls, `${BASE}Silver_stocks.xls`, `${BASE}Silver_Stocks.xls`]],
       ['mtdPdf',    urls.mtdPdf],
       ['dailyPdf',  urls.dailyPdf],
+      ['ytdPdf',    urls.ytdPdf],
     ];
     const fetchedData: Record<string, any> = {};
     for (const [name, url] of fileOrder) {
@@ -858,7 +1028,7 @@ async function startServer() {
         await humanDelay(3000, 8000);
       }
     }
-    const { goldXls: goldXlsData, silverXls: silverXlsData, mtdPdf: mtdPdfData, dailyPdf: dailyPdfData } = fetchedData;
+    const { goldXls: goldXlsData, silverXls: silverXlsData, mtdPdf: mtdPdfData, dailyPdf: dailyPdfData, ytdPdf: ytdPdfData } = fetchedData;
 
     // Process XLS Files
     const processXlsData = async (data: any, metal: string) => {
@@ -985,6 +1155,7 @@ async function startServer() {
           ]);
 
           if (parsedData.report_type === "DAILY" && d.all_firms) {
+            console.log(`📋 Inserting ${d.all_firms.length} delivery notice rows for ${metal}`);
             for (const firm of d.all_firms) {
               await client.query(`
                 INSERT INTO delivery_notices (date, firm, issued, stopped, metal, account_type)
@@ -1006,13 +1177,90 @@ async function startServer() {
       }
     };
 
-    for (const [pdfData, filename] of [[mtdPdfData, "MetalsIssuesAndStopsMTDReport.pdf"], [dailyPdfData, "MetalsIssuesAndStopsReport.pdf"]] as const) {
+    // Process MTD PDF with text-based parser
+    try {
+      await processPdfData(mtdPdfData, "MetalsIssuesAndStopsMTDReport.pdf");
+    } catch (e: any) {
+      console.error(`❌ Failed to process MetalsIssuesAndStopsMTDReport.pdf:`, e.message);
+      results.errors.push({ file: "MetalsIssuesAndStopsMTDReport.pdf", message: e.message });
+    }
+
+    // Process Daily PDF with layout-aware parser (correct issued/stopped columns)
+    if (dailyPdfData && pdfjsLib) {
       try {
-        await processPdfData(pdfData, filename);
+        const layoutResult = await parseDailyPdfWithLayout(Buffer.from(dailyPdfData));
+        if (layoutResult && layoutResult.business_date) {
+          const reportDate = layoutResult.business_date;
+          results.parsed["MetalsIssuesAndStopsReport.pdf"] = reportDate;
+
+          const client = await pool.connect();
+          try {
+            await client.query('BEGIN');
+
+            for (const [metal, d] of Object.entries(layoutResult.metals)) {
+              // Insert into metals_summary
+              await client.query(`
+                INSERT INTO metals_summary (date, metal, report_type, settlement, daily_issued, daily_stopped)
+                VALUES ($1, $2, 'DAILY', $3, $4, $5)
+                ON CONFLICT(date, metal, report_type) DO UPDATE SET
+                  settlement = EXCLUDED.settlement,
+                  daily_issued = EXCLUDED.daily_issued,
+                  daily_stopped = EXCLUDED.daily_stopped
+              `, [reportDate, metal, d.settlement || null, d.daily_issued || null, d.daily_stopped || null]);
+
+              // Insert delivery notices with correct column assignment
+              if (d.all_firms && d.all_firms.length > 0) {
+                console.log(`📋 [layout] Inserting ${d.all_firms.length} delivery notice rows for ${metal}`);
+                for (const firm of d.all_firms) {
+                  await client.query(`
+                    INSERT INTO delivery_notices (date, firm, issued, stopped, metal, account_type)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT(date, firm, metal, account_type) DO UPDATE SET
+                      issued = EXCLUDED.issued,
+                      stopped = EXCLUDED.stopped
+                  `, [reportDate, firm.firm, firm.issued, firm.stopped, metal, firm.org === "C" ? "CUSTOMER" : "HOUSE"]);
+                }
+              } else {
+                console.warn(`⚠️ [layout] No firms parsed for ${metal}`);
+              }
+            }
+
+            await client.query('COMMIT');
+          } catch (e) {
+            await client.query('ROLLBACK');
+            throw e;
+          } finally {
+            client.release();
+          }
+        } else {
+          console.warn('⚠️ Layout parser returned no business date — falling back to text parser');
+          await processPdfData(dailyPdfData, "MetalsIssuesAndStopsReport.pdf");
+        }
       } catch (e: any) {
-        console.error(`❌ Failed to process ${filename}:`, e.message);
-        results.errors.push({ file: filename, message: e.message });
+        console.error(`❌ Layout parser failed, falling back to text parser:`, e.message);
+        try {
+          await processPdfData(dailyPdfData, "MetalsIssuesAndStopsReport.pdf");
+        } catch (e2: any) {
+          console.error(`❌ Text parser also failed:`, e2.message);
+          results.errors.push({ file: "MetalsIssuesAndStopsReport.pdf", message: e2.message });
+        }
       }
+    } else if (dailyPdfData) {
+      // pdfjs-dist not available — use text parser as fallback
+      try {
+        await processPdfData(dailyPdfData, "MetalsIssuesAndStopsReport.pdf");
+      } catch (e: any) {
+        console.error(`❌ Failed to process MetalsIssuesAndStopsReport.pdf:`, e.message);
+        results.errors.push({ file: "MetalsIssuesAndStopsReport.pdf", message: e.message });
+      }
+    }
+
+    // Process YTD PDF (monthly delivery totals for the comparison chart)
+    try {
+      await processPdfData(ytdPdfData, "MetalsIssuesAndStopsYTDReport.pdf");
+    } catch (e: any) {
+      console.error(`❌ Failed to process MetalsIssuesAndStopsYTDReport.pdf:`, e.message);
+      results.errors.push({ file: "MetalsIssuesAndStopsYTDReport.pdf", message: e.message });
     }
 
     if (results.errors.length > 0) {

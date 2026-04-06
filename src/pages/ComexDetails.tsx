@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Upload, Download, Filter, ChevronRight, AlertCircle, RefreshCw, Loader2, Info } from 'lucide-react';
 import { cn } from '../utils/cn';
 import HistoricalComparisonChart from '../components/HistoricalComparisonChart';
+import DeliveryPace from '../components/DeliveryPace';
 import MetalsSummary from '../components/MetalsSummary';
 import InstitutionalActivity from '../components/InstitutionalActivity';
 
@@ -144,6 +145,9 @@ export default function ComexDetails() {
 
       {/* Metals Summary Component */}
       <MetalsSummary key={refreshKey} />
+
+      {/* Delivery Pace Indicator */}
+      <DeliveryPace />
 
       {/* Historical Comparison Chart Component */}
       <HistoricalComparisonChart />
