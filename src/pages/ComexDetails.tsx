@@ -3,6 +3,7 @@ import { Upload, Download, Filter, ChevronRight, AlertCircle, RefreshCw, Loader2
 import { cn } from '../utils/cn';
 import HistoricalComparisonChart from '../components/HistoricalComparisonChart';
 import DeliveryPace from '../components/DeliveryPace';
+import NetPositioning from '../components/NetPositioning';
 import MetalsSummary from '../components/MetalsSummary';
 import InstitutionalActivity from '../components/InstitutionalActivity';
 
@@ -148,6 +149,9 @@ export default function ComexDetails() {
 
       {/* Delivery Pace Indicator */}
       <DeliveryPace />
+
+      {/* Net Positioning — Who is buying vs selling */}
+      <NetPositioning />
 
       {/* Historical Comparison Chart Component */}
       <HistoricalComparisonChart />
