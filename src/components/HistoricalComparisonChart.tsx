@@ -36,6 +36,11 @@ const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Se
 
 const ALL_TIME_HIGH = 76567;
 
+// Active COMEX gold delivery months (traditionally even months — Feb, Apr, Jun, Aug, Oct, Dec)
+// But data shows Feb, May, Dec as the real heavy hitters
+const ACTIVE_DELIVERY_MONTHS = new Set(["Feb", "Apr", "Jun", "Aug", "Oct", "Dec"]);
+const PEAK_MONTHS = new Set(["Feb", "Dec"]); // Historically highest volume
+
 const CustomTooltip = ({ active, payload, label, year }: any) => {
   if (active && payload && payload.length) {
     const yearData = payload.find((p: any) => p.dataKey === 'yearValue');
@@ -51,13 +56,28 @@ const CustomTooltip = ({ active, payload, label, year }: any) => {
     const isAbove = yearVal > avgVal;
     const isNearRecord = yearVal >= ALL_TIME_HIGH * 0.95;
 
+    const isActive = ACTIVE_DELIVERY_MONTHS.has(label);
+    const isPeak = PEAK_MONTHS.has(label);
+
     return (
       <div className="bg-[#121212] border border-[#333] p-3 rounded-lg shadow-xl min-w-[200px]">
         <div className="flex items-center justify-between mb-2">
-          <p className="text-zinc-400 text-xs font-bold uppercase tracking-wider">{label} {year}</p>
+          <div className="flex items-center gap-2">
+            <p className="text-zinc-400 text-xs font-bold uppercase tracking-wider">{label} {year}</p>
+            {isPeak && (
+              <span className="bg-gold-500/20 text-gold-500 text-[8px] font-black px-1.5 py-0.5 rounded uppercase">
+                Peak Month
+              </span>
+            )}
+            {isActive && !isPeak && (
+              <span className="bg-zinc-700/50 text-zinc-400 text-[8px] font-black px-1.5 py-0.5 rounded uppercase">
+                Active
+              </span>
+            )}
+          </div>
           {isNearRecord && (
             <span className="bg-rose-500 text-white text-[8px] font-black px-1.5 py-0.5 rounded uppercase animate-pulse">
-              Near Record Volume
+              Near Record
             </span>
           )}
         </div>
@@ -144,10 +164,35 @@ export default function HistoricalComparisonChart() {
       .map(month => ({
         name: month,
         yearValue: yearData[month],
-        averageValue: HISTORICAL_DATA.averages[month]
+        averageValue: HISTORICAL_DATA.averages[month],
+        isActiveDelivery: ACTIVE_DELIVERY_MONTHS.has(month),
+        isPeak: PEAK_MONTHS.has(month)
       }))
       .filter(item => item.yearValue !== null && item.yearValue !== undefined && item.yearValue !== 0);
   }, [selectedYear, liveMtd]);
+
+  const CustomXTick = ({ x, y, payload }: any) => {
+    const month = payload.value;
+    const isActive = ACTIVE_DELIVERY_MONTHS.has(month);
+    const isPeak = PEAK_MONTHS.has(month);
+    return (
+      <g transform={`translate(${x},${y})`}>
+        <text
+          dy={16}
+          textAnchor="middle"
+          fill={isPeak ? '#F39C12' : isActive ? '#9CA3AF' : '#555'}
+          fontSize={11}
+          fontFamily="JetBrains Mono"
+          fontWeight={isActive ? 700 : 400}
+        >
+          {month}
+        </text>
+        {isActive && (
+          <circle cx={0} cy={28} r={2.5} fill={isPeak ? '#F39C12' : '#6B7280'} />
+        )}
+      </g>
+    );
+  };
 
   return (
     <div className="glass-card p-6 bg-[#121212] border-[#333] rounded-2xl w-full">
@@ -179,14 +224,13 @@ export default function HistoricalComparisonChart() {
             barGap={8}
           >
             <CartesianGrid strokeDasharray="3 3" stroke="#222" vertical={false} />
-            <XAxis 
-              dataKey="name" 
-              stroke="#444" 
-              fontSize={11} 
-              tickLine={false} 
+            <XAxis
+              dataKey="name"
+              stroke="#444"
+              tickLine={false}
               axisLine={false}
-              dy={10}
-              fontFamily="JetBrains Mono"
+              tick={<CustomXTick />}
+              height={45}
             />
             <YAxis 
               stroke="#444" 
@@ -229,18 +273,31 @@ export default function HistoricalComparisonChart() {
         </ResponsiveContainer>
       </div>
 
-      <div className="mt-6 p-4 bg-zinc-900/50 rounded-xl border border-[#222]">
+      {/* Delivery Month Legend */}
+      <div className="mt-4 flex items-center gap-6 px-2">
+        <div className="flex items-center gap-2">
+          <circle className="inline-block w-2 h-2 rounded-full bg-gold-500" />
+          <div className="w-2 h-2 rounded-full bg-gold-500" />
+          <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Peak Delivery Month (Feb, Dec)</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="w-2 h-2 rounded-full bg-zinc-500" />
+          <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Active Delivery Month (Even months)</span>
+        </div>
+      </div>
+
+      <div className="mt-4 p-4 bg-zinc-900/50 rounded-xl border border-[#222]">
         <div className="flex items-center gap-2 mb-2">
           <div className="w-1 h-4 bg-gold-500 rounded-full" />
           <span className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Market Insight</span>
         </div>
         <p className="text-xs text-zinc-500 leading-relaxed font-medium">
-          The orange bars represent the physical delivery volume for {selectedYear}. 
-          The 5Y Average now reflects the "New Normal" of the 2024-2025 physical squeeze.
-          {selectedYear === '2026' ? ' Current 2026 data shows a massive acceleration in physical gold drain, with February reaching 40,711 contracts.' : ''}
-          {selectedYear === '2025' ? ' February 2025 set an all-time record of 76,567 contracts, completely skewing historical averages.' : ''}
-          {selectedYear === '2024' ? ' Note the massive spike in May 2024 (37,050 contracts), signaling the start of the current physical squeeze.' : ''}
-          {['2021', '2022'].includes(selectedYear) ? ' During the "Quiet Era" of 2021-2022, delivery volumes were consistently below the current 5Y average.' : ''}
+          COMEX gold active delivery months are Feb, Apr, Jun, Aug, Oct, Dec (dots below axis).
+          Feb and Dec historically see the heaviest volume. Odd months (Jan, Mar, May, Jul, Sep, Nov) typically see lower delivery activity, though the 2024-2025 physical squeeze elevated all months.
+          {selectedYear === '2026' ? ' Feb 2026 saw 40,711 contracts — the second-highest on record behind Feb 2025 (76,567).' : ''}
+          {selectedYear === '2025' ? ' February 2025 set an all-time record of 76,567 contracts. December closed at 37,098.' : ''}
+          {selectedYear === '2024' ? ' May 2024 (37,050) broke the even-month pattern, signaling the start of the physical squeeze.' : ''}
+          {['2021', '2022'].includes(selectedYear) ? ' During 2021-2022, delivery volumes were uniformly low across all months.' : ''}
         </p>
       </div>
     </div>

@@ -8,6 +8,9 @@ const HISTORICAL_AVERAGES: Record<string, number> = {
   Nov: 13650, Dec: 16550
 };
 
+const ACTIVE_DELIVERY_MONTHS = new Set(["Feb", "Apr", "Jun", "Aug", "Oct", "Dec"]);
+const PEAK_MONTHS = new Set(["Feb", "Dec"]);
+
 // Approximate trading days per month
 const TRADING_DAYS: Record<string, number> = {
   Jan: 21, Feb: 19, Mar: 21, Apr: 21, May: 21,
@@ -119,9 +122,20 @@ export default function DeliveryPace() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h3 className="text-xl font-black text-zinc-100 tracking-tight">Delivery Pace</h3>
-          <p className="text-zinc-500 text-xs font-medium uppercase tracking-widest mt-1">
-            {pace.monthName} 2026 — Day {pace.dayOfMonth} ({pace.tradingDaysElapsed} of ~{pace.totalTradingDays} trading days)
-          </p>
+          <div className="flex items-center gap-2 mt-1">
+            <p className="text-zinc-500 text-xs font-medium uppercase tracking-widest">
+              {pace.monthName} 2026 — Day {pace.dayOfMonth} ({pace.tradingDaysElapsed} of ~{pace.totalTradingDays} trading days)
+            </p>
+            {PEAK_MONTHS.has(pace.monthName) && (
+              <span className="bg-gold-500/20 text-gold-500 text-[8px] font-black px-1.5 py-0.5 rounded uppercase">Peak Month</span>
+            )}
+            {ACTIVE_DELIVERY_MONTHS.has(pace.monthName) && !PEAK_MONTHS.has(pace.monthName) && (
+              <span className="bg-zinc-700/50 text-zinc-400 text-[8px] font-black px-1.5 py-0.5 rounded uppercase">Active Delivery Month</span>
+            )}
+            {!ACTIVE_DELIVERY_MONTHS.has(pace.monthName) && (
+              <span className="bg-zinc-800/50 text-zinc-600 text-[8px] font-black px-1.5 py-0.5 rounded uppercase">Off-Cycle Month</span>
+            )}
+          </div>
         </div>
         <div className={cn("flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-black uppercase tracking-wider", signalBg, signalColor)}>
           <SignalIcon className="w-3.5 h-3.5" />
