@@ -5,7 +5,7 @@ import HistoricalComparisonChart from '../components/HistoricalComparisonChart';
 import DeliveryPace from '../components/DeliveryPace';
 import NetPositioning from '../components/NetPositioning';
 import MetalsSummary from '../components/MetalsSummary';
-import InstitutionalActivity from '../components/InstitutionalActivity';
+import FirmFlowHeatmap from '../components/FirmFlowHeatmap';
 
 interface DeliveryNotice {
   id: number;
@@ -330,8 +330,8 @@ export default function ComexDetails() {
         </div>
       )}
 
-      {/* Institutional Activity */}
-      <InstitutionalActivity metal={selectedMetal} />
+      {/* Firm Flow Heatmap — Visual institutional tracker */}
+      <FirmFlowHeatmap metal={selectedMetal} />
 
       {/* Alert System */}
       <div className="bg-gold-500/10 border border-gold-500/20 p-6 rounded-2xl flex gap-4">

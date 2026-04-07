@@ -85,6 +85,14 @@ export default function DeliveryPace() {
     const average = HISTORICAL_AVERAGES[monthName] || 0;
     const vsAvgPercent = average > 0 ? ((projected - average) / average) * 100 : 0;
 
+    // How far through the month are we (as %)
+    const monthProgress = tradingDaysElapsed / totalTradingDays;
+    const isEarly = monthProgress < 0.25; // Less than 25% through the month
+
+    // Where would the average month be at this point?
+    const avgAtThisPoint = Math.round(average * monthProgress);
+    const vsAvgAtThisPoint = avgAtThisPoint > 0 ? ((currentTotal - avgAtThisPoint) / avgAtThisPoint) * 100 : 0;
+
     // Previous completed months from YTD
     const prevMonthIdx = monthIdx - 1;
     const prevMonthName = prevMonthIdx >= 0 ? MONTH_NAMES[prevMonthIdx] : "Dec";
@@ -92,6 +100,8 @@ export default function DeliveryPace() {
     const prevMonthAvg = HISTORICAL_AVERAGES[prevMonthName] || 0;
     const prevVsAvg = prevMonthTotal && prevMonthAvg > 0 ? ((prevMonthTotal - prevMonthAvg) / prevMonthAvg) * 100 : null;
 
+    // Use the point-in-time comparison for signals, not the raw projection
+    // Early in the month, first-notice-day inflates the rate heavily
     return {
       monthName,
       dayOfMonth,
@@ -102,20 +112,25 @@ export default function DeliveryPace() {
       projected,
       average,
       vsAvgPercent,
+      avgAtThisPoint,
+      vsAvgAtThisPoint,
+      isEarly,
+      monthProgress,
       prevMonthName,
       prevMonthTotal,
       prevVsAvg,
-      isHot: vsAvgPercent > 50,
-      isCold: vsAvgPercent < -30,
+      // Only flag elevated/below if we have enough data, or use point-in-time comparison
+      isHot: isEarly ? false : vsAvgPercent > 50,
+      isCold: isEarly ? false : vsAvgPercent < -30,
     };
   }, [mtdData, ytdMonths]);
 
   if (!pace) return null;
 
-  const SignalIcon = pace.isHot ? Zap : pace.isCold ? TrendingDown : Activity;
-  const signalColor = pace.isHot ? 'text-amber-400' : pace.isCold ? 'text-blue-400' : 'text-zinc-400';
-  const signalBg = pace.isHot ? 'bg-amber-500/10 border-amber-500/30' : pace.isCold ? 'bg-blue-500/10 border-blue-500/30' : 'bg-zinc-800/50 border-zinc-700/50';
-  const signalLabel = pace.isHot ? 'ELEVATED DEMAND' : pace.isCold ? 'BELOW AVERAGE' : 'NORMAL PACE';
+  const SignalIcon = pace.isEarly ? Activity : pace.isHot ? Zap : pace.isCold ? TrendingDown : Activity;
+  const signalColor = pace.isEarly ? 'text-zinc-400' : pace.isHot ? 'text-amber-400' : pace.isCold ? 'text-blue-400' : 'text-zinc-400';
+  const signalBg = pace.isEarly ? 'bg-zinc-800/50 border-zinc-700/50' : pace.isHot ? 'bg-amber-500/10 border-amber-500/30' : pace.isCold ? 'bg-blue-500/10 border-blue-500/30' : 'bg-zinc-800/50 border-zinc-700/50';
+  const signalLabel = pace.isEarly ? 'TOO EARLY TO CALL' : pace.isHot ? 'ELEVATED DEMAND' : pace.isCold ? 'BELOW AVERAGE' : 'NORMAL PACE';
 
   return (
     <div className="glass-card p-6 bg-[#121212] border-[#333] rounded-2xl w-full">
@@ -158,13 +173,23 @@ export default function DeliveryPace() {
           <p className="text-[10px] text-zinc-600 mt-1">contracts / trading day</p>
         </div>
 
-        {/* Projected Month-End */}
+        {/* Point-in-Time vs Average */}
         <div className="bg-zinc-900/50 rounded-xl p-4 border border-[#222]">
-          <p className="text-[10px] font-black text-zinc-500 uppercase tracking-widest mb-1">Projected Total</p>
-          <p className="text-2xl font-black text-zinc-100">{pace.projected.toLocaleString()}</p>
-          <p className={cn("text-[10px] mt-1 font-bold", pace.vsAvgPercent > 0 ? "text-emerald-500" : "text-rose-500")}>
-            {pace.vsAvgPercent > 0 ? '+' : ''}{pace.vsAvgPercent.toFixed(0)}% vs 5Y avg ({pace.average.toLocaleString()})
+          <p className="text-[10px] font-black text-zinc-500 uppercase tracking-widest mb-1">
+            {pace.isEarly ? 'vs Avg at This Point' : 'Projected Total'}
           </p>
+          <p className="text-2xl font-black text-zinc-100">
+            {pace.isEarly ? pace.currentTotal.toLocaleString() : pace.projected.toLocaleString()}
+          </p>
+          {pace.isEarly ? (
+            <p className={cn("text-[10px] mt-1 font-bold", pace.vsAvgAtThisPoint > 0 ? "text-emerald-500" : "text-rose-500")}>
+              {pace.vsAvgAtThisPoint > 0 ? '+' : ''}{pace.vsAvgAtThisPoint.toFixed(0)}% vs avg at day {pace.tradingDaysElapsed} (~{pace.avgAtThisPoint.toLocaleString()})
+            </p>
+          ) : (
+            <p className={cn("text-[10px] mt-1 font-bold", pace.vsAvgPercent > 0 ? "text-emerald-500" : "text-rose-500")}>
+              {pace.vsAvgPercent > 0 ? '+' : ''}{pace.vsAvgPercent.toFixed(0)}% vs 5Y avg ({pace.average.toLocaleString()})
+            </p>
+          )}
         </div>
 
         {/* Previous Month */}
@@ -209,11 +234,13 @@ export default function DeliveryPace() {
           <span className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Pace Signal</span>
         </div>
         <p className="text-xs text-zinc-500 leading-relaxed font-medium">
-          {pace.isHot
-            ? `Physical delivery demand is running hot. At ${pace.dailyRate.toLocaleString()} contracts/day, ${pace.monthName} is on pace to reach ${pace.projected.toLocaleString()} — ${Math.abs(pace.vsAvgPercent).toFixed(0)}% above the 5-year average. Institutions are aggressively taking physical delivery.`
-            : pace.isCold
-              ? `Delivery pace is subdued at ${pace.dailyRate.toLocaleString()} contracts/day. Projected ${pace.projected.toLocaleString()} would be ${Math.abs(pace.vsAvgPercent).toFixed(0)}% below average. Physical demand may be cooling.`
-              : `Delivery pace is tracking near normal at ${pace.dailyRate.toLocaleString()} contracts/day. Projected ${pace.projected.toLocaleString()} is within range of the 5-year average (${pace.average.toLocaleString()}).`
+          {pace.isEarly
+            ? `Early month — only ${pace.tradingDaysElapsed} of ~${pace.totalTradingDays} trading days in. First-notice-day volume is typically 5-10x a normal day, so the daily rate (${pace.dailyRate.toLocaleString()}/day) will drop significantly. At this point, ${pace.monthName} has ${pace.currentTotal.toLocaleString()} contracts vs ~${pace.avgAtThisPoint.toLocaleString()} where the average month would be. The projection will become meaningful after ~5 trading days.`
+            : pace.isHot
+              ? `Physical delivery demand is running hot. At ${pace.dailyRate.toLocaleString()} contracts/day, ${pace.monthName} is on pace to reach ${pace.projected.toLocaleString()} — ${Math.abs(pace.vsAvgPercent).toFixed(0)}% above the 5-year average.`
+              : pace.isCold
+                ? `Delivery pace is subdued at ${pace.dailyRate.toLocaleString()} contracts/day. Projected ${pace.projected.toLocaleString()} would be ${Math.abs(pace.vsAvgPercent).toFixed(0)}% below average. Physical demand may be cooling.`
+                : `Delivery pace is tracking near normal at ${pace.dailyRate.toLocaleString()} contracts/day. Projected ${pace.projected.toLocaleString()} is within range of the 5-year average (${pace.average.toLocaleString()}).`
           }
           {pace.prevMonthTotal && pace.prevVsAvg !== null && (
             ` Last month (${pace.prevMonthName}) closed at ${pace.prevMonthTotal.toLocaleString()} (${pace.prevVsAvg > 0 ? '+' : ''}${pace.prevVsAvg.toFixed(0)}% vs avg).`
