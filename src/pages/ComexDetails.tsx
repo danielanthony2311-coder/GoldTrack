@@ -18,7 +18,6 @@ interface DeliveryNotice {
 }
 
 export default function ComexDetails() {
-  const [isSyncing, setIsSyncing] = useState(false);
   const [syncType, setSyncType] = useState<'DAILY' | 'MTD' | 'YTD'>('DAILY');
   const [selectedMetal, setSelectedMetal] = useState<string>('GOLD');
   const [dailyData, setDailyData] = useState<any>(null);
@@ -26,7 +25,7 @@ export default function ComexDetails() {
   const [ytdData, setYtdData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
+  const [refreshKey] = useState(0);
 
   const fetchData = async () => {
     setLoading(true);
@@ -77,28 +76,6 @@ export default function ComexDetails() {
     }
   };
 
-  const handleSync = async () => {
-    setIsSyncing(true);
-    try {
-      const response = await fetch('/api/cme/sync');
-      const syncResult = await response.json();
-      // Always refresh — partial syncs (e.g. silver 403) still write gold data
-      await fetchData();
-
-      if (!response.ok) throw new Error('Sync request failed');
-      if (syncResult.errors?.length) {
-        const detail = syncResult.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n');
-        setError(`Partial sync — some files failed:\n${detail}`);
-      }
-      setRefreshKey(prev => prev + 1);
-    } catch (err: any) {
-      console.error(err);
-      alert('Failed to sync with CME: ' + err.message);
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
   useEffect(() => {
     fetchData();
   }, [selectedMetal]);
@@ -127,17 +104,6 @@ export default function ComexDetails() {
             <option value="MTD">MTD Report</option>
             <option value="YTD">YTD Report</option>
           </select>
-          <button 
-            onClick={handleSync}
-            disabled={isSyncing}
-            className={cn(
-              "flex items-center gap-2 px-4 py-2 bg-gold-500 text-black font-bold rounded-lg hover:bg-gold-400 transition-all",
-              isSyncing && "opacity-50 cursor-not-allowed"
-            )}
-          >
-            {isSyncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-            {isSyncing ? 'Syncing...' : 'Sync CME'}
-          </button>
           <button className="p-2 bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-400 hover:text-zinc-100">
             <Download className="w-5 h-5" />
           </button>
@@ -181,7 +147,17 @@ export default function ComexDetails() {
             <div className="glass-card p-6">
               <div className="flex items-center justify-between mb-6">
                 <div>
-                  <h3 className="font-bold text-lg">Daily Big Movers: Buyers</h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-bold text-lg">Daily Big Movers: Buyers</h3>
+                    <div className="group relative">
+                      <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+                      <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                        <p className="mb-2"><strong>"Stopping"</strong> means a firm is taking physical delivery of gold. They want the actual metal, not just a paper contract.</p>
+                        <p className="mb-2"><strong>House account</strong> stops are the strongest signal — the bank is buying gold for its own book.</p>
+                        <p>When multiple large firms are stopping simultaneously, it signals institutional conviction in higher prices.</p>
+                      </div>
+                    </div>
+                  </div>
                   <p className="text-xs text-zinc-500 uppercase tracking-widest mt-1">Institutional "Stopping" (Receiving Physical)</p>
                 </div>
                 <div className="bg-emerald-500/10 text-emerald-500 px-2 py-1 rounded text-[10px] font-black uppercase">
@@ -222,7 +198,17 @@ export default function ComexDetails() {
             <div className="glass-card p-6">
               <div className="flex items-center justify-between mb-6">
                 <div>
-                  <h3 className="font-bold text-lg">Daily Big Movers: Sellers</h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-bold text-lg">Daily Big Movers: Sellers</h3>
+                    <div className="group relative">
+                      <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+                      <div className="absolute top-full right-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                        <p className="mb-2"><strong>"Issuing"</strong> means a firm is delivering physical gold out of their vault. They are the supply side.</p>
+                        <p className="mb-2">High issuing from one firm could mean they're selling inventory — or fulfilling customer withdrawal requests.</p>
+                        <p>Context matters: selling during a price rally is bearish. Selling during consolidation may just be normal market making.</p>
+                      </div>
+                    </div>
+                  </div>
                   <p className="text-xs text-zinc-500 uppercase tracking-widest mt-1">Institutional "Issuing" (Delivering Physical)</p>
                 </div>
                 <div className="bg-rose-500/10 text-rose-500 px-2 py-1 rounded text-[10px] font-black uppercase">

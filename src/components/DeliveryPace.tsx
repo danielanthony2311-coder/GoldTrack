@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { TrendingUp, TrendingDown, Zap, Activity } from 'lucide-react';
+import { TrendingUp, TrendingDown, Zap, Activity, Info } from 'lucide-react';
 import { cn } from '../utils/cn';
 
 const HISTORICAL_AVERAGES: Record<string, number> = {
@@ -136,7 +136,17 @@ export default function DeliveryPace() {
     <div className="glass-card p-6 bg-[#121212] border-[#333] rounded-2xl w-full">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h3 className="text-xl font-black text-zinc-100 tracking-tight">Delivery Pace</h3>
+          <div className="flex items-center gap-2">
+            <h3 className="text-xl font-black text-zinc-100 tracking-tight">Delivery Pace</h3>
+            <div className="group relative">
+              <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+              <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                <p className="mb-2"><strong>Delivery Pace</strong> tracks how many futures contracts are being settled with physical gold this month.</p>
+                <p className="mb-2"><strong>Elevated</strong> = more people demanding real metal than normal. Bullish signal — physical demand is strong.</p>
+                <p><strong>Below Average</strong> = quieter month for physical delivery. Less urgency in the market. Early in the month, first-notice-day volume inflates the rate — wait 5+ trading days for a reliable read.</p>
+              </div>
+            </div>
+          </div>
           <div className="flex items-center gap-2 mt-1">
             <p className="text-zinc-500 text-xs font-medium uppercase tracking-widest">
               {pace.monthName} 2026 — Day {pace.dayOfMonth} ({pace.tradingDaysElapsed} of ~{pace.totalTradingDays} trading days)

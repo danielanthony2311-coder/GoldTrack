@@ -270,7 +270,17 @@ export default function CBTracker() {
             <div className="glass-card p-6">
               <div className="flex items-center justify-between mb-6">
                 <div>
-                  <h3 className="font-bold text-lg">Global Central Bank Buying</h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-bold text-lg">Global Central Bank Buying</h3>
+                    <div className="group relative">
+                      <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+                      <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                        <p className="mb-2"><strong>Central banks</strong> are the largest, most patient gold buyers. Their purchases are structural — building reserves over decades, not trading for profits.</p>
+                        <p className="mb-2">When net buying exceeds <strong>50 tonnes/month</strong> globally, it puts a strong floor under gold prices.</p>
+                        <p>Multiple countries buying simultaneously signals coordinated de-dollarisation — the strongest structural bullish signal for gold.</p>
+                      </div>
+                    </div>
+                  </div>
                   <p className="text-xs text-zinc-500 uppercase tracking-widest mt-1">Monthly net gold purchases across all tracked countries (tonnes)</p>
                 </div>
                 <div className="flex items-center gap-4 text-[10px] font-bold uppercase text-zinc-500">
@@ -322,7 +332,17 @@ export default function CBTracker() {
             <div className="lg:col-span-2 glass-card p-6">
               <div className="flex items-center justify-between mb-6">
                 <div>
-                  <h3 className="font-bold text-lg">Global Leaderboard: Official Gold Reserves</h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-bold text-lg">Global Leaderboard: Official Gold Reserves</h3>
+                    <div className="group relative">
+                      <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+                      <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                        <p className="mb-2">Official reserves as reported to the IMF / World Gold Council. <strong>Gold bars</strong> = actively buying countries. Grey = flat or selling.</p>
+                        <p className="mb-2">Click on any country bar to see their buying history over time.</p>
+                        <p>Note: China's reported numbers likely understate actual purchases. Shanghai Gold Exchange withdrawals suggest 2-3x the officially reported buying.</p>
+                      </div>
+                    </div>
+                  </div>
                   <p className="text-xs text-zinc-500 uppercase tracking-widest mt-1">
                     Top 15 Holders (Tonnes) — Latest Available Data
                   </p>
@@ -419,7 +439,16 @@ export default function CBTracker() {
             <div className="space-y-6">
               {/* Accumulation Streaks */}
               <div className="glass-card p-6">
-                <h3 className="font-bold text-lg mb-1">Buying Streaks</h3>
+                <div className="flex items-center gap-2 mb-1">
+                  <h3 className="font-bold text-lg">Buying Streaks</h3>
+                  <div className="group relative">
+                    <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+                    <div className="absolute top-full right-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                      <p className="mb-2">Countries on a <strong>sustained buying streak</strong> — consecutive months/years of net gold purchases.</p>
+                      <p>Long streaks (6+ months) signal serious reserve-building, not opportunistic dips. China and Poland on multi-year streaks = structural demand that won't reverse on a price pullback.</p>
+                    </div>
+                  </div>
+                </div>
                 <p className="text-[10px] text-zinc-500 uppercase tracking-widest mb-4">
                   Consecutive {hasMonthlyData ? 'months' : 'years'} of net buying
                 </p>

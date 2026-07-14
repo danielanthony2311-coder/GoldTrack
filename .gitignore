@@ -2,3 +2,6 @@ node_modules
 .env.local
 gold_data.db
 logs/*.log
+dist
+server-rs/target
+server-rs/node_modules

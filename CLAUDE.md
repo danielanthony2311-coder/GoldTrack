@@ -46,6 +46,9 @@ GoldTrack/
 | `/comex` | COMEX Details | Historical charts, MTD/YTD reports, CME sync |
 | `/cb-tracker` | CB Tracker | Central bank gold reserves leaderboard |
 | `/mining-synergy` | Mining Synergy | Mining analytics |
+| `/supply` | Physical Supply | COMEX warehouse, OI, ETF, LBMA |
+| `/positioning` | Positioning | Gold/Silver ratio, Gold vs DXY, COT |
+| `/patterns` | Pattern Library | Pre-registered backtested patterns: survivors, graveyard, chance disclosure |
 
 ## Backend API Endpoints
 
@@ -59,6 +62,13 @@ All routes are prefixed with `/api`:
 | GET | `/api/cme/summary` | MTD/DAILY/YTD metals summary |
 | GET | `/api/cme/vault-breakdown` | Vault-level stock distribution |
 | GET | `/api/history` | Alias for latest-stocks |
+| GET | `/api/dxy/sync` | Seed/update DXY (US Dollar Index) data |
+| GET | `/api/dxy/latest` | DXY history (last 90 days) |
+| GET | `/api/export/csv` | Download all collected data as CSV |
+| GET | `/api/goldhistory/sync` | Backfill/refresh the long-run history DB (LBMA 1968+, FRED macro, CFTC COT 1986+, GLD 2004+, events). Idempotent full upsert; part of the nightly pipeline |
+| GET | `/api/goldhistory/summary` | Validation report: row counts, date ranges, gap check, sanity bounds, LBMA-vs-GLD cross-check |
+| GET | `/api/patterns/run` | Recompute all pre-registered pattern backtests (frozen definitions; part of nightly pipeline) |
+| GET | `/api/patterns/library` | Pattern library: survivors/graveyard/insufficient + honesty summary (feeds `/patterns` page) |
 
 ## Database Schema
 
@@ -86,7 +96,39 @@ Tables are auto-created on startup via `CREATE TABLE IF NOT EXISTS`. All `id` co
 - UNIQUE: `(date, metal, report_type)`
 - Index: `idx_summary_metal_date (metal, date DESC)`
 
-Data retention: warehouse_stocks and vault_stocks auto-purge entries beyond 90 days (`RETENTION_DAYS` constant in `server.ts`).
+**`dxy_index`** — US Dollar Index daily closes
+- `date` (UNIQUE), `close`, `source`
+- Index: `idx_dxy_date (date DESC)`
+
+Data retention: kept forever by default (`RETENTION_DAYS` env var, default `0` = no purge). Set `RETENTION_DAYS=90` to restore the old auto-purge of warehouse_stocks and vault_stocks. History accumulation is a product feature — do not purge in production.
+
+**`market_narratives`** — AI-generated daily interpretation (see `analysis.ts`)
+- `date`, `metal`, `headline`, `narrative`, `theory`, `what_changed`, `confidence`, `watch_next`, `sources` (JSONB), `signals` (JSONB), `model`
+- UNIQUE: `(date, metal)`
+
+**`app_state`** — Key/value store (`key` TEXT PK, `value`, `updated_at`); tracks `last_pipeline_at` for the boot catch-up check.
+
+### `gold_history` schema (long-run history DB — see `history.ts`)
+
+Separate namespace holding decades of backfilled data from official primary sources. All syncs are idempotent full upserts (~105k rows, ~30s).
+
+- **`lbma_prices`** — `(date, metal)` PK; `usd`, `gbp`, `eur`. LBMA gold PM fix + silver fix, daily since 1968 (prices.lbma.org.uk official JSON, no key)
+- **`fred_series`** — `(series_id, date)` PK; `value`. Nine macro series via `fredgraph.csv` (no API key): DFII10, DGS10, FEDFUNDS, CPIAUCSL, DTWEXBGS, DTWEXM, DFEDTAR, DFEDTARU, VIXCLS
+- **`cot_reports`** — `(report_date, metal)` PK; OI + noncommercial/commercial/nonreportable long/short. CFTC Socrata API (`publicreporting.cftc.gov/resource/6dca-aqww.json`), weekly since 1986. Contract codes: GOLD 088691, SILVER 084691. Incremental after first backfill
+- **`gld_holdings`** — `date` PK; close, oz/share, NAV/share, total oz, tonnes, volume. Official SPDR archive XLSX (`api.spdrgoldshares.com/api/v1/historical-archive`), daily since Nov 2004. Holiday rows skipped
+- **`events`** — `(date, label)` PK; 18 curated crisis/geopolitical events + ~180 Fed policy changes DERIVED via SQL from DFEDTAR/DFEDTARU (never hand-typed)
+
+Validation: `/api/goldhistory/summary` cross-checks the GLD-implied gold price (NAV/share ÷ oz/share) against the LBMA fix — median diff must be ~0%. Verified 2026-07-10: 0.0000% over 5,300 overlapping days.
+
+### Pattern engine (`patterns.ts`)
+
+Pre-registered backtests over `gold_history` — 13 GOLD hypotheses frozen in code (`HYPOTHESES` array). Statistical guardrails ALL live in the shared engine, never per-pattern: point-in-time publication lags (`LAG_DAYS`), expanding-window percentiles (a day is ranked only against prior days), episode grouping (≥63 trading days apart, n = episodes not days), next-day entry, Wilson 95% intervals, n<15 → INSUFFICIENT with no stats shown, first/second-half holdout, adjacent-horizon sign consistency, threshold-perturbation robustness (`variants`), pre-1971-08-16 exclusion. **Definitions are frozen by SHA-256 hash** — the engine refuses to overwrite a pattern whose definition changed; register the revision under a NEW id (lineage stays visible). Failed patterns stay in the library as NO_EDGE (the graveyard is the anti-cherry-picking proof). Results go to `gold_history.pattern_stats`. `getRegimeContext()` (rolling 2-y gold-vs-real-yield correlation) is injected into the AI narrative prompt for GOLD.
+
+- **`pattern_stats`** — `pattern_id` PK; `definition_hash`, family/name/description/rationale, `expected_direction`, `primary_horizon` (21/63/126 td), `status` (SURVIVED/NO_EDGE/INSUFFICIENT), `n_episodes`, `checks` JSONB, `results` JSONB (eras full/firstHalf/secondHalf/recent × horizons), `variants` JSONB, `active_today`
+
+Endpoints: GET `/api/patterns/run` (recompute + store; in SYNC_ENDPOINTS so it refreshes nightly after the history sync), GET `/api/patterns/library` (summary incl. `expectedSurvivorsByChance` + all patterns; feeds `/patterns` page).
+
+**When adding a hypothesis:** add it to `HYPOTHESES` with an honest ex-ante `rationale`, pick `direction` and `primaryHorizon` BEFORE looking at results, give it threshold `variants`, and never edit it afterwards — revisions get a new id.
 
 ## Environment Variables
 
@@ -100,6 +142,7 @@ PGUSER=postgres
 PGPASSWORD=your_password
 PGSSLMODE=require       # Set to 'require' to enable SSL (uses rejectUnauthorized: false)
 GEMINI_API_KEY=your_key # Google Gemini API (optional, injected into Vite build)
+ANTHROPIC_API_KEY=your_key # Claude API — powers the AI market narrative (optional; panel shows setup hint if unset)
 ```
 
 **Required vars:** `PGHOST`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`. Server will refuse to start if any are missing.
@@ -131,6 +174,12 @@ GEMINI_API_KEY=your_key # Google Gemini API (optional, injected into Vite build)
 - Dark background: `#0B0E11`
 - Reusable class `glass-card` for frosted glass card effect (defined in `index.css`)
 - Fonts: Inter (sans), JetBrains Mono (mono)
+
+## Requirements
+
+- **Automated pipeline updates everything**: There are no manual Sync All buttons. Every new data source MUST be added to `SYNC_ENDPOINTS` in `server.ts` (the nightly automated pipeline, ~line 2798). Current sync list: `/api/cme/sync`, `/api/cb/sync`, `/api/prices/sync`, `/api/etf/sync`, `/api/lbma/sync`, `/api/oi/sync`, `/api/dxy/sync`. The pipeline runs weeknights at 21:00 ET (cron, with random start jitter and 20–90s pauses between sources) plus a catch-up run on server boot if the last run was >20h ago (`last_pipeline_at` in `app_state`). Disable with `AUTO_SYNC=off`.
+- **Anti-blocking**: CME sync uses human-like delays, UA rotation, cookie harvesting, cooldowns, and sequential fetching to avoid IP blocks. All new external data syncs must follow the same pattern.
+- **CSV Export**: `/api/export/csv` joins all gold data (price, warehouse, OI, DXY, delivery notices) by date into one downloadable CSV. Must include any new data columns when added.
 
 ## Notes
 

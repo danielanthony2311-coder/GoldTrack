@@ -10,7 +10,7 @@ import {
   Legend,
   Cell
 } from 'recharts';
-import { ChevronDown } from 'lucide-react';
+import { ChevronDown, Info } from 'lucide-react';
 import { cn } from '../utils/cn';
 
 const HISTORICAL_DATA: any = {
@@ -198,7 +198,17 @@ export default function HistoricalComparisonChart() {
     <div className="glass-card p-6 bg-[#121212] border-[#333] rounded-2xl w-full">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
         <div>
-          <h3 className="text-xl font-black text-zinc-100 tracking-tight">COMEX Delivery Comparison</h3>
+          <div className="flex items-center gap-2">
+            <h3 className="text-xl font-black text-zinc-100 tracking-tight">COMEX Delivery Comparison</h3>
+            <div className="group relative">
+              <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+              <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                <p className="mb-2"><strong>Gold bars</strong> = actual delivery contracts for the selected year. <strong>Grey bars</strong> = 5-year average for that month.</p>
+                <p className="mb-2">Gold dots under the axis mark <strong>active delivery months</strong> (Feb, Apr, Jun, Aug, Oct, Dec). These months see the heaviest physical activity.</p>
+                <p>When a year consistently beats the 5Y average, it signals elevated physical demand. Feb 2025 (76,567) was the all-time record.</p>
+              </div>
+            </div>
+          </div>
           <p className="text-zinc-500 text-xs font-medium uppercase tracking-widest mt-1">Historical vs. 5Y Average</p>
         </div>
 

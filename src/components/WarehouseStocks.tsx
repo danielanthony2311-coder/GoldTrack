@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { 
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Cell
+import {
+  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Cell
 } from 'recharts';
-import { ArrowUpRight, ArrowDownRight, Database, Info, Loader2, Bug, ChevronDown, ChevronUp, AlertCircle, RefreshCw, Layers } from 'lucide-react';
+import { ArrowUpRight, ArrowDownRight, Database, Info, Loader2, Bug, ChevronDown, ChevronUp, AlertCircle, RefreshCw, Layers, Download } from 'lucide-react';
 import { cn } from '../utils/cn';
 
 interface StockData {
@@ -21,16 +21,35 @@ interface VaultData {
   eligible_oz: number;
 }
 
-export default function WarehouseStocks() {
+type Props = {
+  refreshKey?: number;
+};
+
+export default function WarehouseStocks({ refreshKey }: Props) {
   const [metal, setMetal] = useState<'GOLD' | 'SILVER'>('GOLD');
   const [data, setData] = useState<StockData[]>([]);
   const [vaultData, setVaultData] = useState<VaultData[]>([]);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [debugInfo, setDebugInfo] = useState<any>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [showDebug, setShowDebug] = useState(false);
+  const [chartRange, setChartRange] = useState(30);
+
+  const exportCSV = () => {
+    if (data.length === 0) return;
+    const header = 'Date,Metal,Registered_oz,Eligible_oz,Total_oz,Daily_Change_Registered,Daily_Change_Eligible\n';
+    const rows = data.map(d =>
+      `${d.date},${metal},${d.registered_oz},${d.eligible_oz},${d.total_oz},${d.daily_change_registered ?? ''},${d.daily_change_eligible ?? ''}`
+    ).join('\n');
+    const blob = new Blob([header + rows], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${metal.toLowerCase()}_warehouse_stocks_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const fetchData = async (signal?: AbortSignal) => {
     try {
@@ -71,43 +90,15 @@ export default function WarehouseStocks() {
     }
   };
 
-  const handleRefresh = async () => {
-    setRefreshing(true);
-    setError(null);
-    try {
-      const response = await fetch('/api/cme/sync');
-      const result = await response.json();
-      
-      setDebugInfo(result);
-
-      // Always refresh charts — gold may have synced even if silver 403'd
-      await fetchData();
-
-      // Surface partial errors as warnings (don't block chart update)
-      if (!response.ok) {
-        throw new Error('Sync request failed');
-      }
-      if (result.errors?.length) {
-        const detail = result.errors.map((e: any) => `${e.file}: ${e.message}`).join('\n');
-        setError(`Partial sync — some files failed:\n${detail}`);
-      }
-    } catch (err: any) {
-      console.error(err);
-      setError(err.message);
-    } finally {
-      setRefreshing(false);
-    }
-  };
-
   useEffect(() => {
     const controller = new AbortController();
     fetchData(controller.signal);
-    const interval = setInterval(() => fetchData(controller.signal), 5 * 60 * 1000); // 5 minutes
+    const interval = setInterval(() => fetchData(controller.signal), 5 * 60 * 1000);
     return () => {
       controller.abort();
       clearInterval(interval);
     };
-  }, [metal]);
+  }, [metal, refreshKey]);
 
   if (loading && data.length === 0) {
     return (
@@ -122,10 +113,18 @@ export default function WarehouseStocks() {
   const conversionFactor = metal === 'GOLD' ? 32150.7 : 32150.7; // Both are oz per tonne
   const totalTonnes = latest ? (latest.total_oz / conversionFactor).toFixed(2) : '0';
 
-  // FIX 1: Dynamic Y-axis scale
-  const allValues = data.flatMap(d => [d.registered_oz, d.total_oz]);
-  const minValue = allValues.length > 0 ? Math.min(...allValues) - 500000 : 0;
-  const maxValue = allValues.length > 0 ? Math.max(...allValues) + 500000 : 35000000;
+  // Filter data to selected chart range
+  const chartData = data.slice(-chartRange);
+
+  // Separate Y-axis domains so both lines show meaningful variation
+  const regValues = chartData.map(d => d.registered_oz).filter(v => v > 0);
+  const totalValues = chartData.map(d => d.total_oz).filter(v => v > 0);
+  const regMin = regValues.length > 0 ? Math.min(...regValues) : 0;
+  const regMax = regValues.length > 0 ? Math.max(...regValues) : 20000000;
+  const totalMin = totalValues.length > 0 ? Math.min(...totalValues) : 0;
+  const totalMax = totalValues.length > 0 ? Math.max(...totalValues) : 35000000;
+  const regPad = Math.max((regMax - regMin) * 0.15, 200000);
+  const totalPad = Math.max((totalMax - totalMin) * 0.15, 200000);
 
   const isOldData = latest && new Date(latest.date).toDateString() !== new Date().toDateString();
 
@@ -169,18 +168,14 @@ export default function WarehouseStocks() {
             </button>
           </div>
 
-          <button 
-            onClick={handleRefresh}
-            disabled={refreshing}
-            className={cn(
-              "flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all bg-zinc-900 text-zinc-400 border border-zinc-800 hover:text-zinc-100",
-              refreshing && "opacity-50 cursor-not-allowed"
-            )}
+          <button
+            onClick={exportCSV}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all bg-zinc-900 text-zinc-400 border border-zinc-800 hover:text-zinc-100"
           >
-            {refreshing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
-            {refreshing ? 'Syncing...' : 'Sync CME'}
+            <Download className="w-3 h-3" />
+            CSV
           </button>
-          <button 
+          <button
             onClick={() => setShowDebug(!showDebug)}
             className={cn(
               "flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all",
@@ -263,28 +258,31 @@ export default function WarehouseStocks() {
 
       {/* Metric Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <StockMetricCard 
+        <StockMetricCard
           title="Registered Stocks"
           value={latest?.registered_oz.toLocaleString() || '0'}
           change={latest?.daily_change_registered || 0}
           deltaLabel={latest?.delta_label}
           description="Available for immediate delivery"
           source="Source: CME Warehouse Report"
+          tooltip="Gold that's been certified and warranted for COMEX futures delivery. A declining trend means physical supply is tightening — bullish for price."
         />
-        <StockMetricCard 
+        <StockMetricCard
           title="Eligible Stocks"
           value={latest?.eligible_oz.toLocaleString() || '0'}
           change={latest?.daily_change_eligible || 0}
           deltaLabel={latest?.delta_label}
           description="In storage, not for delivery"
           source="Source: CME Warehouse Report"
+          tooltip="Gold sitting in COMEX-approved vaults but NOT offered for delivery. Owners are storing it privately. Rising eligible + falling registered = holders pulling metal from the delivery pool."
         />
-        <StockMetricCard 
+        <StockMetricCard
           title="Total Stocks"
           value={latest?.total_oz.toLocaleString() || '0'}
           subValue={`${totalTonnes} Tonnes`}
           description="Combined vault inventory"
           source="Source: CME Warehouse Report"
+          tooltip="Registered + Eligible combined. If total is stable but registered drops, metal is moving from deliverable to private storage — a sign of accumulation."
         />
       </div>
 
@@ -292,62 +290,109 @@ export default function WarehouseStocks() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 glass-card p-6">
           <div className="flex items-center justify-between mb-6">
-            <h3 className="font-semibold text-lg">30-Day Inventory Trend</h3>
-            <div className="flex items-center gap-4 text-[10px] font-bold uppercase">
-              <div className="flex items-center gap-1.5">
-                <div className="w-2 h-2 bg-gold-500 rounded-full" />
-                <span className="text-zinc-400">Registered</span>
+            <h3 className="font-semibold text-lg">Inventory Trend</h3>
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-4 text-[10px] font-bold uppercase">
+                <div className="flex items-center gap-1.5">
+                  <div className="w-2 h-2 bg-gold-500 rounded-full" />
+                  <span className="text-zinc-400">Registered</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <div className="w-2 h-2 bg-zinc-600 rounded-full" />
+                  <span className="text-zinc-400">Total</span>
+                </div>
               </div>
-              <div className="flex items-center gap-1.5">
-                <div className="w-2 h-2 bg-zinc-600 rounded-full" />
-                <span className="text-zinc-400">Total</span>
+              <div className="flex bg-zinc-950 p-0.5 rounded-lg border border-zinc-800">
+                {[7, 30, 60, 90].map(d => (
+                  <button
+                    key={d}
+                    onClick={() => setChartRange(d)}
+                    className={cn(
+                      "px-2.5 py-1 text-[10px] font-bold rounded-md transition-all",
+                      chartRange === d
+                        ? "bg-gold-500 text-black shadow-sm"
+                        : "text-zinc-500 hover:text-zinc-300"
+                    )}
+                  >
+                    {d}D
+                  </button>
+                ))}
               </div>
             </div>
           </div>
           <div className="h-[300px] w-full">
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={data}>
+              <AreaChart data={chartData}>
+                <defs>
+                  <linearGradient id="gradRegistered" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#F39C12" stopOpacity={0.3} />
+                    <stop offset="100%" stopColor="#F39C12" stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="gradTotal" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#71717a" stopOpacity={0.15} />
+                    <stop offset="100%" stopColor="#71717a" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-                <XAxis 
-                  dataKey="date" 
-                  stroke="#71717a" 
-                  fontSize={10} 
-                  tickLine={false} 
+                <XAxis
+                  dataKey="date"
+                  stroke="#71717a"
+                  fontSize={10}
+                  tickLine={false}
                   axisLine={false}
                   tickFormatter={(val) => new Date(val).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  interval={Math.max(Math.floor(chartData.length / 8), 0)}
                 />
-                <YAxis 
-                  stroke="#71717a" 
-                  fontSize={10} 
-                  tickLine={false} 
+                <YAxis
+                  yAxisId="left"
+                  stroke="#F39C12"
+                  fontSize={10}
+                  tickLine={false}
                   axisLine={false}
                   tickFormatter={(val) => `${(val / 1000000).toFixed(1)}M`}
-                  domain={[minValue, maxValue]}
+                  domain={[regMin - regPad, regMax + regPad]}
+                  label={{ value: 'Registered', angle: -90, position: 'insideLeft', style: { fill: '#F39C12', fontSize: 9, fontWeight: 700 }, offset: 10 }}
                 />
-                <Tooltip 
+                <YAxis
+                  yAxisId="right"
+                  orientation="right"
+                  stroke="#71717a"
+                  fontSize={10}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={(val) => `${(val / 1000000).toFixed(1)}M`}
+                  domain={[totalMin - totalPad, totalMax + totalPad]}
+                  label={{ value: 'Total', angle: 90, position: 'insideRight', style: { fill: '#71717a', fontSize: 9, fontWeight: 700 }, offset: 10 }}
+                />
+                <Tooltip
                   contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '8px' }}
                   itemStyle={{ fontSize: '12px' }}
                   labelStyle={{ color: '#71717a', marginBottom: '4px', fontSize: '10px' }}
+                  formatter={(value: number, name: string) => [`${(value / 1000000).toFixed(3)}M oz`, name]}
                 />
-                <Line 
-                  type="monotone" 
-                  dataKey="registered_oz" 
+                <Area
+                  yAxisId="left"
+                  type="monotone"
+                  dataKey="registered_oz"
                   name="Registered"
-                  stroke="#D4AF37" 
-                  strokeWidth={2} 
-                  dot={true}
-                  r={3}
-                  activeDot={{ r: 5, strokeWidth: 0 }}
-                />
-                <Line 
-                  type="monotone" 
-                  dataKey="total_oz" 
-                  name="Total"
-                  stroke="#3f3f46" 
-                  strokeWidth={2} 
+                  stroke="#F39C12"
+                  strokeWidth={2}
+                  fill="url(#gradRegistered)"
                   dot={false}
+                  activeDot={{ r: 4, strokeWidth: 0, fill: '#F39C12' }}
                 />
-              </LineChart>
+                <Area
+                  yAxisId="right"
+                  type="monotone"
+                  dataKey="total_oz"
+                  name="Total"
+                  stroke="#52525b"
+                  strokeWidth={1.5}
+                  fill="url(#gradTotal)"
+                  dot={false}
+                  activeDot={{ r: 4, strokeWidth: 0, fill: '#71717a' }}
+                />
+              </AreaChart>
             </ResponsiveContainer>
           </div>
         </div>
@@ -379,7 +424,7 @@ export default function WarehouseStocks() {
                     contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '8px' }}
                     formatter={(value: any) => [value.toLocaleString() + ' oz', '']}
                   />
-                  <Bar dataKey="registered_oz" name="Registered" fill="#D4AF37" stackId="a" radius={[0, 0, 0, 0]} />
+                  <Bar dataKey="registered_oz" name="Registered" fill="#F39C12" stackId="a" radius={[0, 0, 0, 0]} />
                   <Bar dataKey="eligible_oz" name="Eligible" fill="#3f3f46" stackId="a" radius={[0, 4, 4, 0]} />
                 </BarChart>
               </ResponsiveContainer>
@@ -399,12 +444,22 @@ export default function WarehouseStocks() {
   );
 }
 
-function StockMetricCard({ title, value, change, subValue, description, source, deltaLabel }: any) {
+function StockMetricCard({ title, value, change, subValue, description, source, deltaLabel, tooltip }: any) {
   const isPositive = change > 0;
   return (
     <div className="glass-card p-6 space-y-2">
       <div className="flex items-center justify-between">
-        <span className="text-zinc-400 text-sm font-medium">{title}</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-zinc-400 text-sm font-medium">{title}</span>
+          {tooltip && (
+            <div className="group relative">
+              <Info className="w-3.5 h-3.5 text-zinc-600 cursor-help" />
+              <div className="absolute top-full left-0 mt-2 w-64 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                {tooltip}
+              </div>
+            </div>
+          )}
+        </div>
         {change !== undefined && (
           <div className="flex flex-col items-end">
             <div className={cn(

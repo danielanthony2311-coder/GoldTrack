@@ -1,74 +1,88 @@
-import React, { useState, useEffect } from 'react';
-import { 
-  LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
-} from 'recharts';
-import { ArrowUpRight, ArrowDownRight, Info, ShieldAlert, Zap, Loader2 } from 'lucide-react';
-import { COMEX_METRICS, generateStockHistory, TOP_BUYERS, DIVERGENCE_INDEX } from '../data/mockData';
+import { useState, useEffect, type ReactNode } from 'react';
+import {
+  ArrowUpRight, ArrowDownRight, Minus, Loader2, RefreshCw,
+  TrendingUp, TrendingDown, AlertTriangle, Activity, Pause
+} from 'lucide-react';
 import { cn } from '../utils/cn';
-import WarehouseStocks from '../components/WarehouseStocks';
+import PriceChart from '../components/PriceChart';
+import BasisSpread from '../components/BasisSpread';
+import AlertBanner from '../components/AlertBanner';
+import DailyBrief from '../components/DailyBrief';
+import MarketNarrative from '../components/MarketNarrative';
 
-const stockData = generateStockHistory(90);
+type Signal = 'BULLISH' | 'BEARISH' | 'CAUTIOUS' | 'MIXED' | 'QUIET';
+
+const SIGNAL_CFG: Record<Signal, { label: string; text: string; icon: ReactNode }> = {
+  BULLISH:  { label: 'Bullish',  text: 'text-zinc-300', icon: <TrendingUp className="w-3.5 h-3.5" /> },
+  BEARISH:  { label: 'Bearish',  text: 'text-zinc-300', icon: <TrendingDown className="w-3.5 h-3.5" /> },
+  CAUTIOUS: { label: 'Cautious', text: 'text-zinc-300', icon: <AlertTriangle className="w-3.5 h-3.5" /> },
+  MIXED:    { label: 'Mixed',    text: 'text-zinc-300', icon: <Activity className="w-3.5 h-3.5" /> },
+  QUIET:    { label: 'Quiet',    text: 'text-zinc-500', icon: <Pause className="w-3.5 h-3.5" /> },
+};
+
+const SIGNAL_BAR_COLORS: Record<string, string> = {
+  BULLISH: 'bg-emerald-500',
+  BEARISH: 'bg-rose-500',
+  CAUTIOUS: 'bg-amber-500',
+  MIXED: 'bg-sky-500',
+  QUIET: 'bg-zinc-700',
+};
 
 export default function Dashboard() {
   const [metal, setMetal] = useState<'GOLD' | 'SILVER'>('GOLD');
-  const [buyerType, setBuyerType] = useState<'stopped' | 'issued'>('stopped');
-  const [dailyDeliveries, setDailyDeliveries] = useState<number | null>(null);
-  const [firmData, setFirmData] = useState<{ firm: string, amount: number }[]>([]);
   const [loading, setLoading] = useState(true);
-  const [hasFirmData, setHasFirmData] = useState(false);
 
-  const [latestStocks, setLatestStocks] = useState<any>(null);
   const [settlementPrice, setSettlementPrice] = useState<number | null>(null);
+  const [priceChange, setPriceChange] = useState<number | null>(null);
+  const [priceChangePct, setPriceChangePct] = useState<number | null>(null);
+  const [signal, setSignal] = useState<Signal>('QUIET');
+  const [signalHistory, setSignalHistory] = useState<{ date: string; signal: string; close: number; pricePct: number | null; regChange: number }[]>([]);
 
   useEffect(() => {
     const fetchData = async () => {
       setLoading(true);
       try {
-        // Fetch all three in parallel
-        const [stocksRes, summaryRes, noticesRes] = await Promise.all([
+        const [priceRes, stocksRes, histRes] = await Promise.all([
+          fetch(`/api/prices/latest?metal=${metal}`),
           fetch(`/api/cme/latest-stocks?metal=${metal}`),
-          fetch(`/api/cme/summary?metal=${metal}&type=DAILY`),
-          fetch(`/api/cme/latest-notices?metal=${metal}`),
+          fetch('/api/prices/signal-history'),
         ]);
 
-        if (!stocksRes.ok) throw new Error(`Stocks API error: ${stocksRes.status}`);
-        if (!summaryRes.ok) throw new Error(`Summary API error: ${summaryRes.status}`);
-        if (!noticesRes.ok) throw new Error(`Notices API error: ${noticesRes.status}`);
+        if (priceRes.ok) {
+          const priceJson = await priceRes.json();
+          const prices = priceJson?.prices ?? [];
+          if (prices.length > 0) {
+            setSettlementPrice(prices[0].close);
+            setPriceChange(prices[0].changeUsd);
+            setPriceChangePct(prices[0].changePct);
+          }
 
-        const [stocksData, summaryData, noticesData] = await Promise.all([
-          stocksRes.json(),
-          summaryRes.json(),
-          noticesRes.json(),
-        ]);
+          if (stocksRes.ok) {
+            const stocks = await stocksRes.json();
+            if (Array.isArray(stocks) && stocks.length > 0) {
+              const recentPrices = prices.slice(0, 3);
+              const recentStocks = stocks.slice(-3);
+              const avgPct = recentPrices.reduce((s: number, p: any) => s + (p.changePct ?? 0), 0) / (recentPrices.length || 1);
+              const totalReg = recentStocks.reduce((s: number, st: any) => s + (st.daily_change_registered ?? 0), 0);
 
-        if (stocksData && stocksData.length > 0) {
-          setLatestStocks(stocksData[stocksData.length - 1]);
+              if (Math.abs(avgPct) < 0.1 && Math.abs(totalReg) < 5000) {
+                setSignal('QUIET');
+              } else {
+                const up = avgPct > 0;
+                const sDown = totalReg < 0;
+                if (up && sDown) setSignal('BULLISH');
+                else if (!up && !sDown) setSignal('MIXED');
+                else if (up && !sDown) setSignal('CAUTIOUS');
+                else if (!up && sDown) setSignal('BEARISH');
+                else setSignal('QUIET');
+              }
+            }
+          }
         }
 
-        if (summaryData && summaryData.length > 0) {
-          const latest = summaryData[0];
-          setDailyDeliveries(latest.daily_stopped || 0);
-          setSettlementPrice(latest.settlement || null);
-        }
-
-        if (noticesData && noticesData.length > 0) {
-          // Filter out vault operators if they accidentally appear
-          const vaultOperators = ["BRINK'S", "HSBC", "JP MORGAN CHASE", "MANFRA", "MALCA-AMIT", "DELAWARE DEPOSITORY"];
-          const filtered = noticesData.filter((n: any) => !vaultOperators.some(v => n.firm.toUpperCase().includes(v)));
-          
-          const displayData = filtered
-            .map((item: any) => ({
-              name: item.firm,
-              amount: buyerType === 'stopped' ? item.stopped : item.issued
-            }))
-            .filter((item: any) => item.amount > 0)
-            .sort((a: any, b: any) => b.amount - a.amount)
-            .slice(0, 5);
-          
-          setFirmData(displayData);
-          setHasFirmData(displayData.length > 0);
-        } else {
-          setHasFirmData(false);
+        if (histRes.ok) {
+          const histJson = await histRes.json();
+          setSignalHistory(histJson?.history ?? []);
         }
       } catch (e) {
         console.error('Failed to fetch dashboard data', e);
@@ -77,209 +91,129 @@ export default function Dashboard() {
       }
     };
     fetchData();
-  }, [buyerType, metal]);
+  }, [metal]);
+
+  const pUp = (priceChangePct ?? 0) > 0;
+  const pDown = (priceChangePct ?? 0) < 0;
+  const sig = SIGNAL_CFG[signal];
 
   return (
-    <div className="space-y-8">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight mb-2">Market Overview</h1>
-          <p className="text-zinc-400">Real-time COMEX and Central Bank analytics.</p>
-        </div>
-        
-        <div className="flex items-center gap-6">
-          {/* Metal Toggle */}
+    <div className="space-y-10">
+      {/* ─── TOP BAR ─── */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <h1 className="text-2xl font-bold tracking-tight">Market Overview</h1>
+        <div className="flex items-center gap-3 flex-wrap">
+          <DailyBrief />
           <div className="flex bg-zinc-950 p-1 rounded-lg border border-zinc-800">
-            <button 
+            <button
               onClick={() => setMetal('GOLD')}
-              className={cn(
-                "px-4 py-1.5 text-xs font-bold rounded-md transition-all",
-                metal === 'GOLD' ? "bg-gold-500 text-black shadow-sm" : "text-zinc-500 hover:text-zinc-300"
-              )}
-            >
-              Gold
-            </button>
-            <button 
+              className={cn("px-3 py-1 text-xs font-bold rounded-md transition-all", metal === 'GOLD' ? "bg-gold-500 text-black shadow-sm" : "text-zinc-500 hover:text-zinc-300")}
+            >Gold</button>
+            <button
               onClick={() => setMetal('SILVER')}
-              className={cn(
-                "px-4 py-1.5 text-xs font-bold rounded-md transition-all",
-                metal === 'SILVER' ? "bg-zinc-800 text-zinc-100 shadow-sm" : "text-zinc-500 hover:text-zinc-300"
-              )}
-            >
-              Silver
-            </button>
+              className={cn("px-3 py-1 text-xs font-bold rounded-md transition-all", metal === 'SILVER' ? "bg-zinc-800 text-zinc-100 shadow-sm" : "text-zinc-500 hover:text-zinc-300")}
+            >Silver</button>
           </div>
+        </div>
+      </div>
 
-          {/* Settlement Price Display */}
-          <div className="flex flex-col">
-            <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">{metal} Settlement</span>
-            <div className="flex items-center gap-2">
-              <span className={cn(
-                "text-2xl font-black",
-                metal === 'GOLD' ? "text-gold-500" : "text-zinc-100"
-              )}>
-                {settlementPrice ? `$${settlementPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '—'}
-              </span>
-              <div className="flex items-center text-zinc-500 text-[10px] font-bold uppercase tracking-tighter">
-                <span>Source: CME Daily Report</span>
+      {/* ─── HERO PRICE + SIGNAL HISTORY ─── */}
+      <div className="glass-card p-8">
+        {loading && !settlementPrice ? (
+          <div className="flex items-center gap-3 text-zinc-500">
+            <Loader2 className="w-5 h-5 animate-spin" />
+            <span className="text-sm">Loading…</span>
+          </div>
+        ) : (
+          <>
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+              <div>
+                <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-3">
+                  {metal} Settlement Price
+                </p>
+                <div className="flex items-end gap-4 flex-wrap">
+                  <span className={cn(
+                    "text-5xl font-black tracking-tight leading-none",
+                    metal === 'GOLD' ? "text-gold-500" : "text-zinc-100"
+                  )}>
+                    {settlementPrice
+                      ? `$${settlementPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
+                      : '—'}
+                  </span>
+                  {priceChangePct != null && (
+                    <div className="flex items-center gap-2 pb-1">
+                      <span className={cn(
+                        "flex items-center gap-1 text-lg font-bold",
+                        pUp ? "text-zinc-300" : pDown ? "text-zinc-400" : "text-zinc-500"
+                      )}>
+                        {pUp ? <ArrowUpRight className="w-5 h-5" /> : pDown ? <ArrowDownRight className="w-5 h-5" /> : <Minus className="w-5 h-5" />}
+                        {priceChangePct > 0 ? '+' : ''}{priceChangePct.toFixed(2)}%
+                      </span>
+                      {priceChange != null && (
+                        <span className="text-sm text-zinc-600">
+                          ({priceChange > 0 ? '+' : ''}${priceChange.toFixed(2)})
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 px-4 py-2 rounded-full border border-zinc-700/50 bg-zinc-800/30 self-start md:self-center">
+                <span className={sig.text}>{sig.icon}</span>
+                <span className={cn("text-xs font-bold uppercase tracking-wider", sig.text)}>
+                  {sig.label}
+                </span>
               </div>
             </div>
-          </div>
-        </div>
-      </div>
 
-      {/* Live Warehouse Stocks Section */}
-      <WarehouseStocks />
-
-      {/* Metric Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <MetricCard 
-          title={`Daily Deliveries (${metal})`}
-          value={loading ? '...' : `${dailyDeliveries || 0} Contracts`}
-          trend={dailyDeliveries && dailyDeliveries > 100 ? "High" : "Normal"}
-          isPositive={dailyDeliveries ? dailyDeliveries > 100 : false}
-          description={`Total ${metal.toLowerCase()} contracts delivered today`}
-          color={dailyDeliveries && dailyDeliveries > 100 ? (metal === 'GOLD' ? 'text-amber-500' : 'text-zinc-300') : 'text-zinc-100'}
-          source="Source: CME MTD PDF (Daily Total)"
-        />
-        <MetricCard 
-          title={`Registered Stocks (${metal})`}
-          value={latestStocks ? `${(latestStocks.registered_oz / 1000000).toFixed(2)}M oz` : '...'}
-          trend={latestStocks && latestStocks.daily_change_registered !== null && latestStocks.daily_change_registered !== undefined ? `${(latestStocks.daily_change_registered / 1000).toFixed(1)}k` : '—'}
-          isPositive={latestStocks?.daily_change_registered > 0}
-          description={`Physical ${metal.toLowerCase()} available for immediate delivery`}
-          source="Source: CME Warehouse Report"
-        />
-      </div>
-
-      {/* Charts Grid */}
-      <div className="grid grid-cols-1 gap-6">
-        {/* Buyers Bar Chart */}
-        <div className="glass-card p-6">
-          <div className="flex items-center justify-between mb-6">
-            <div className="flex flex-col">
-              <h3 className="font-semibold text-lg">
-                {buyerType === 'stopped' ? 'Top Institutional Buyers' : 'Top Institutional Sellers'}
-              </h3>
-              <span className="text-xs text-zinc-500">
-                {buyerType === 'stopped' ? 'Contracts Stopped (Taking Delivery)' : 'Contracts Issued (Making Delivery)'}
-              </span>
-            </div>
-            
-            {/* Issued vs Stopped Toggle */}
-            <div className="flex bg-zinc-950 p-1 rounded-lg border border-zinc-800">
-              <button 
-                onClick={() => setBuyerType('stopped')}
-                className={cn(
-                  "px-3 py-1 text-xs font-bold rounded-md transition-all",
-                  buyerType === 'stopped' ? "bg-gold-500 text-black shadow-sm" : "text-zinc-500 hover:text-zinc-300"
-                )}
-              >
-                Buyers
-              </button>
-              <button 
-                onClick={() => setBuyerType('issued')}
-                className={cn(
-                  "px-3 py-1 text-xs font-bold rounded-md transition-all",
-                  buyerType === 'issued' ? "bg-zinc-800 text-zinc-100 shadow-sm" : "text-zinc-500 hover:text-zinc-300"
-                )}
-              >
-                Sellers
-              </button>
-            </div>
-          </div>
-          
-          <div className="h-[300px] w-full flex flex-col items-center justify-center">
-            {loading ? (
-              <Loader2 className="w-6 h-6 text-gold-500 animate-spin" />
-            ) : hasFirmData ? (
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={firmData} layout="vertical" margin={{ left: 20, right: 20 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" horizontal={false} />
-                  <XAxis type="number" hide />
-                  <YAxis 
-                    dataKey="name" 
-                    type="category" 
-                    stroke="#71717a" 
-                    fontSize={10} 
-                    tickLine={false} 
-                    axisLine={false}
-                    width={100}
-                  />
-                  <Tooltip 
-                    cursor={{ fill: '#27272a' }}
-                    contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '8px' }}
-                  />
-                  <Bar 
-                    dataKey="amount" 
-                    fill={buyerType === 'stopped' ? "#f59e0b" : "#3f3f46"} 
-                    radius={[0, 4, 4, 0]} 
-                    barSize={20} 
-                  />
-                </BarChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="text-center space-y-2">
-                <Info className="w-8 h-8 text-zinc-600 mx-auto" />
-                <p className="text-sm text-zinc-500">Upload Daily Issues PDF to see firm data</p>
+            {signalHistory.length > 0 && (
+              <div className="mt-6 pt-5 border-t border-zinc-800/40">
+                <div className="flex items-center justify-between mb-2.5">
+                  <span className="text-[10px] text-zinc-600 uppercase font-bold tracking-wider">30-Day Signal</span>
+                  <div className="flex items-center gap-3 text-[9px] text-zinc-600">
+                    <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" /> Bull</span>
+                    <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500 inline-block" /> Bear</span>
+                    <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-amber-500 inline-block" /> Cautious</span>
+                    <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-sky-500 inline-block" /> Mixed</span>
+                  </div>
+                </div>
+                <div className="flex items-end gap-[2px]">
+                  {[...signalHistory].reverse().map((day) => (
+                    <div key={day.date} className="group relative flex-1 min-w-0">
+                      <div className={cn(
+                        "w-full h-4 rounded-sm opacity-60 group-hover:opacity-100 transition-opacity",
+                        SIGNAL_BAR_COLORS[day.signal] ?? 'bg-zinc-700'
+                      )} />
+                      <div className="absolute top-full left-1/2 -translate-x-1/2 mt-2 w-36 p-2 bg-zinc-900 border border-zinc-700 rounded-lg text-[10px] text-zinc-400 opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                        <p className="font-bold text-zinc-200">{day.date}</p>
+                        <p>Price: ${day.close.toLocaleString()}</p>
+                        <p>Δ: {day.pricePct != null ? `${day.pricePct > 0 ? '+' : ''}${day.pricePct}%` : '—'}</p>
+                        <p>Reg: {day.regChange > 0 ? '+' : ''}{(day.regChange / 1000).toFixed(1)}k oz</p>
+                        <p className="font-bold mt-1">{day.signal}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex justify-between mt-1 text-[9px] text-zinc-700">
+                  <span>{signalHistory.length > 0 ? signalHistory[signalHistory.length - 1]?.date : ''}</span>
+                  <span>{signalHistory[0]?.date ?? ''}</span>
+                </div>
               </div>
             )}
-          </div>
-          
-          {buyerType === 'stopped' && hasFirmData && firmData.some(d => d.amount > 500) && (
-            <div className="mt-4 p-3 bg-gold-500/10 border border-gold-500/20 rounded-lg flex items-center gap-3">
-              <ShieldAlert className="w-4 h-4 text-gold-500" />
-              <p className="text-xs text-gold-500 font-medium">
-                Significant institutional buying detected. Strong physical demand signal.
-              </p>
-            </div>
-          )}
-        </div>
+          </>
+        )}
       </div>
-    </div>
-  );
-}
 
-function MetricCard({ title, value, trend, isPositive, description, color, source }: any) {
-  return (
-    <div className="glass-card p-6 space-y-2">
-      <div className="flex items-center justify-between">
-        <span className="text-zinc-400 text-sm font-medium">{title}</span>
-        <div className={cn(
-          "flex items-center gap-1 text-xs font-bold px-2 py-1 rounded-full",
-          isPositive ? "bg-emerald-500/10 text-emerald-500" : "bg-rose-500/10 text-rose-500"
-        )}>
-          {isPositive ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
-          {trend}
-        </div>
-      </div>
-      <div className={cn("text-3xl font-bold tracking-tight", color)}>
-        {value}
-      </div>
-      <p className="text-xs text-zinc-500 leading-relaxed">{description}</p>
-      {source && (
-        <div className="pt-2 mt-2 border-t border-zinc-800/50">
-          <p className="text-[9px] text-zinc-600 uppercase font-bold tracking-wider">{source}</p>
-        </div>
-      )}
-    </div>
-  );
-}
+      {/* ─── ALERTS ─── */}
+      <AlertBanner />
 
-function AlertItem({ type, title, message, icon }: any) {
-  const colors = {
-    danger: "border-rose-500/20 bg-rose-500/5 text-rose-500",
-    warning: "border-amber-500/20 bg-amber-500/5 text-amber-500",
-    info: "border-blue-500/20 bg-blue-500/5 text-blue-500",
-    success: "border-emerald-500/20 bg-emerald-500/5 text-emerald-500",
-  };
-  
-  return (
-    <div className={cn("p-4 rounded-xl border flex gap-4", colors[type as keyof typeof colors])}>
-      {icon && <div className="mt-0.5">{icon}</div>}
-      <div className="flex-1">
-        <h4 className="font-bold text-sm mb-1">{title}</h4>
-        <p className="text-sm opacity-80">{message}</p>
+      {/* ─── AI INTERPRETATION ─── */}
+      <MarketNarrative metal={metal} />
+
+      {/* ─── PRICE CHARTS ─── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <PriceChart />
+        <BasisSpread />
       </div>
     </div>
   );

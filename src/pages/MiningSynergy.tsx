@@ -28,6 +28,18 @@ export default function MiningSynergy() {
 
   return (
     <div className="space-y-8 pb-12">
+      {/* Mock data disclaimer */}
+      <div className="p-4 rounded-xl border border-amber-500/30 bg-amber-500/5">
+        <div className="flex items-start gap-3">
+          <Info className="w-5 h-5 text-amber-400 mt-0.5 shrink-0" />
+          <div>
+            <p className="text-sm font-bold text-amber-400">Illustrative Data</p>
+            <p className="text-xs text-amber-400/70 mt-1 leading-relaxed">
+              This page uses representative data for demonstration purposes. Mining equity costs (AISC), sovereign flow figures, and supply gap estimates are based on publicly available industry benchmarks but are not sourced from live feeds. Treat as directional context, not actionable data.
+            </p>
+          </div>
+        </div>
+      </div>
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight mb-2">Sovereign-Mining Synergy</h1>
@@ -60,6 +72,14 @@ export default function MiningSynergy() {
         <div className="p-6 border-b border-zinc-800 flex items-center gap-3">
           <Globe className="text-gold-500 w-5 h-5" />
           <h3 className="font-bold text-lg">Global Gold Flow: Sovereign Monthly Pulse</h3>
+          <div className="group relative">
+            <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+            <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+              <p className="mb-2"><strong>Monthly Tonnes</strong> = how much gold each central bank is buying per month. <strong>Shadow Multiplier</strong> estimates actual vs reported buying (mainly for China).</p>
+              <p className="mb-2"><strong>3M Momentum</strong> = 3-month rolling average. If higher than monthly tonnes, buying is decelerating.</p>
+              <p><strong>Strong Accumulation</strong> = 6+ consecutive months of net buying. These countries are building structural positions, not trading.</p>
+            </div>
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
@@ -133,6 +153,14 @@ export default function MiningSynergy() {
           <div className="flex items-center gap-3 mb-6">
             <Calculator className="text-gold-500 w-5 h-5" />
             <h3 className="font-bold text-lg">Miner Margin & AISC Monitor</h3>
+            <div className="group relative">
+              <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+              <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                <p className="mb-2"><strong>AISC</strong> (All-In Sustaining Cost) = the total cost for a miner to produce one ounce of gold, including mining, processing, overhead, and sustaining capex.</p>
+                <p className="mb-2"><strong>Net Margin</strong> = gold price minus AISC. Higher margin = more cash flow per ounce.</p>
+                <p>When margin exceeds 1.5x AISC (Bullish Signal), miners are printing cash — expect dividends, buybacks, and exploration spending.</p>
+              </div>
+            </div>
           </div>
           <div className="space-y-6">
             {MINING_EQUITIES.filter(m => m.aisc).map((miner, i) => {
@@ -202,6 +230,13 @@ export default function MiningSynergy() {
             <div className="flex items-center gap-3">
               <Activity className="text-gold-500 w-5 h-5" />
               <h3 className="font-bold text-lg">House Surge vs. GDX Action</h3>
+              <div className="group relative">
+                <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+                <div className="absolute top-full right-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                  <p className="mb-2"><strong>House Surge</strong> = when bank house accounts spike their physical delivery activity. This means dealers are buying gold for their own book.</p>
+                  <p>When house surge leads GDX (the gold miners ETF), it's a <strong>leading indicator</strong> — smart money is accumulating physical gold before mining stocks re-price. Look for divergences where surge rises but GDX lags.</p>
+                </div>
+              </div>
             </div>
             <div className="flex items-center gap-4 text-[10px] font-black uppercase tracking-widest">
               <div className="flex items-center gap-1.5">
@@ -252,6 +287,13 @@ export default function MiningSynergy() {
         <div className="flex items-center gap-3 mb-8">
           <ShieldAlert className="text-rose-500 w-6 h-6" />
           <h3 className="font-black text-xl uppercase tracking-tighter">The Physical Supply Gap</h3>
+          <div className="group relative">
+            <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+            <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+              <p className="mb-2">Annual gold supply (~4,800t from mines + recycling) doesn't meet total demand (~5,800t). The <strong>~1,000t gap</strong> is filled by existing above-ground stocks — vault withdrawals, central bank sales, ETF outflows.</p>
+              <p>When COMEX and London vaults are draining (tracked on the Physical Supply page), the gap is actively being filled. The question is: how long can above-ground stocks cover the deficit?</p>
+            </div>
+          </div>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
           <div className="md:col-span-3 space-y-8">

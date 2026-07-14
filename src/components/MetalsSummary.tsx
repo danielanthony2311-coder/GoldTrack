@@ -52,11 +52,18 @@ export default function MetalsSummary() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h2 className="text-xl font-bold">Metals Delivery Summary</h2>
-        <div className="flex items-center gap-2 text-xs text-zinc-500">
-          <Info className="w-4 h-4" />
-          <span>Latest data from CME PDF Reports</span>
+        <div className="flex items-center gap-2">
+          <h2 className="text-xl font-bold">Metals Delivery Summary</h2>
+          <div className="group relative">
+            <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+            <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+              <p className="mb-2"><strong>Issued</strong> = contracts where a seller delivers physical metal. <strong>Stopped</strong> = contracts where a buyer takes physical delivery.</p>
+              <p className="mb-2"><strong>MTD</strong> = cumulative contracts delivered this month. Compare to the YTD mini-bars to see if this month is unusually active.</p>
+              <p>Data sourced from CME Group's daily, MTD, and YTD PDF reports.</p>
+            </div>
+          </div>
         </div>
+        <span className="text-xs text-zinc-500">Latest data from CME PDF Reports</span>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">

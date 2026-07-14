@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, BarChart3, Globe, Menu, X, TrendingUp, Zap, ScrollText } from 'lucide-react';
+import { LayoutDashboard, BarChart3, Globe, Menu, X, TrendingUp, Zap, Warehouse, Scale, Download, FlaskConical } from 'lucide-react';
 import { cn } from '../utils/cn';
 
 interface LayoutProps {
@@ -13,10 +13,12 @@ export default function Layout({ children }: LayoutProps) {
 
   const navigation = [
     { name: 'Dashboard', href: '/', icon: LayoutDashboard },
+    { name: 'Physical Supply', href: '/supply', icon: Warehouse },
+    { name: 'Positioning', href: '/positioning', icon: Scale },
+    { name: 'Pattern Library', href: '/patterns', icon: FlaskConical },
     { name: 'COMEX Details', href: '/comex', icon: BarChart3 },
     { name: 'CB Tracker', href: '/cb-tracker', icon: Globe },
     { name: 'Mining Synergy', href: '/mining-synergy', icon: Zap },
-    { name: 'Logs', href: '/logs', icon: ScrollText },
   ];
 
   return (
@@ -86,6 +88,14 @@ export default function Layout({ children }: LayoutProps) {
           </button>
           <div className="flex-1" />
           <div className="flex items-center gap-4">
+            <a
+              href="/api/export/csv"
+              download
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all bg-zinc-900 text-zinc-400 border border-zinc-800 hover:text-zinc-100"
+            >
+              <Download className="w-3 h-3" />
+              Export CSV
+            </a>
             <span className="text-sm text-zinc-400 hidden sm:inline-block">Last updated: {new Date().toLocaleTimeString()}</span>
             <div className="w-8 h-8 rounded-full bg-zinc-800 border border-zinc-700" />
           </div>

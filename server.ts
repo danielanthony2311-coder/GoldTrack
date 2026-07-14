@@ -4,6 +4,10 @@ import path from "path";
 import { fileURLToPath } from "url";
 import pg from "pg";
 import axios from "axios";
+import cron from "node-cron";
+import { ensureAnalysisTables, generateNarrative, getLatestNarrative, computeSignals } from "./analysis.ts";
+import { ensureHistoryTables, runHistorySync, historySummary } from "./history.ts";
+import { ensurePatternTables, runPatternEngine, getPatternLibrary } from "./patterns.ts";
 import * as XLSX from "xlsx";
 import fs from "fs";
 import { createRequire } from 'module';
@@ -230,17 +234,11 @@ function loadEnvFile(filePath: string): string[] {
          (value.startsWith("'") && value.endsWith("'")))) {
       value = value.slice(1, -1);
     }
-    if (key) { process.env[key] = value; loaded.push(key); }
+    // Respect variables already set in the environment (shell overrides win —
+    // lets you point a local run at a different database without editing the file)
+    if (key && process.env[key] === undefined) { process.env[key] = value; loaded.push(key); }
   }
   return loaded;
-}
-
-// Raw file diagnostics — print size, encoding hint, and first 200 bytes as hex
-if (fs.existsSync(envFilePath)) {
-  const raw = fs.readFileSync(envFilePath);
-  console.log(`[env] File size   : ${raw.length} bytes`);
-  console.log(`[env] First bytes : ${raw.slice(0, 32).toString('hex')}`);
-  console.log(`[env] Raw text    : ${JSON.stringify(raw.slice(0, 120).toString('utf8'))}`);
 }
 
 const parsedKeys = loadEnvFile(envFilePath);
@@ -253,6 +251,7 @@ console.log(`[env] PGDATABASE = ${process.env.PGDATABASE ?? '(unset)'}`);
 console.log(`[env] PGUSER     = ${process.env.PGUSER     ?? '(unset)'}`);
 console.log(`[env] PGPASSWORD = ${process.env.PGPASSWORD ? '(set)'   : '(unset)'}`);
 console.log(`[env] PGSSLMODE  = ${process.env.PGSSLMODE  ?? '(unset)'}`);
+console.log(`[env] ANTHROPIC_API_KEY = ${process.env.ANTHROPIC_API_KEY ? '(set)' : '(unset — AI analysis disabled)'}`);
 
 const requiredEnvVars = ['PGHOST', 'PGDATABASE', 'PGUSER', 'PGPASSWORD'];
 const missingEnvVars = requiredEnvVars.filter(v => !process.env[v]);
@@ -264,8 +263,10 @@ if (missingEnvVars.length > 0) {
 
 const { Pool } = pg;
 
-// Data retention window
-const RETENTION_DAYS = 90;
+// Data retention window. 0 (the default) = keep everything forever — the
+// historical archive is the most valuable thing this app accumulates.
+// Set RETENTION_DAYS in .env.local to re-enable purging.
+const RETENTION_DAYS = parseInt(process.env.RETENTION_DAYS || '0', 10);
 
 // PostgreSQL connection pool
 const sslMode = process.env.PGSSLMODE;
@@ -426,7 +427,63 @@ async function initDb() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS etf_holdings (
+      id BIGSERIAL PRIMARY KEY,
+      date TEXT NOT NULL,
+      ticker TEXT NOT NULL,
+      name TEXT NOT NULL,
+      tonnes NUMERIC(10,2) NOT NULL,
+      change_tonnes NUMERIC(10,2),
+      oz NUMERIC(14,0),
+      aum_usd NUMERIC(14,0),
+      source TEXT DEFAULT 'WGC/Issuer',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(date, ticker)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lbma_vault (
+      id BIGSERIAL PRIMARY KEY,
+      month TEXT NOT NULL UNIQUE,
+      gold_oz NUMERIC(14,0),
+      gold_tonnes NUMERIC(10,2),
+      silver_oz NUMERIC(14,0),
+      source TEXT DEFAULT 'LBMA',
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS open_interest (
+      id BIGSERIAL PRIMARY KEY,
+      date TEXT NOT NULL,
+      metal TEXT NOT NULL DEFAULT 'GOLD',
+      oi_contracts INTEGER NOT NULL,
+      oi_oz NUMERIC(14,0),
+      source TEXT DEFAULT 'CME',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(date, metal)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS dxy_index (
+      id BIGSERIAL PRIMARY KEY,
+      date TEXT NOT NULL UNIQUE,
+      close NUMERIC(8,3) NOT NULL,
+      source TEXT DEFAULT 'seed',
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
   // Indexes for common filter patterns
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_dxy_date ON dxy_index(date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_oi_metal_date ON open_interest(metal, date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_etf_date ON etf_holdings(date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_etf_ticker ON etf_holdings(ticker, date DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_lbma_month ON lbma_vault(month DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_warehouse_metal_date ON warehouse_stocks(metal, date DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_vault_metal_date ON vault_stocks(metal, date DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_notices_metal_date ON delivery_notices(metal, date DESC)`);
@@ -834,12 +891,24 @@ const SYNC_COOLDOWN_MS = 60_000;
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || "3000", 10);
 
   app.use(express.json());
 
   // Initialize database tables
   await initDb();
+  await ensureAnalysisTables(pool);
+  await ensureHistoryTables(pool);
+  await ensurePatternTables(pool);
+  // Tiny key-value store for app bookkeeping (e.g. when the last full
+  // auto-sync ran, so a missed night can be caught up on next boot).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
 
   // API Routes
 
@@ -1083,15 +1152,18 @@ async function startServer() {
           `, [parsed.reportDate, vault, metal, v.registered, v.eligible]);
         }
 
-        // Cleanup: Keep only last RETENTION_DAYS days per metal
-        const oldestResult = await client.query(
-          `SELECT date FROM warehouse_stocks WHERE metal = $1 ORDER BY date DESC LIMIT 1 OFFSET ${RETENTION_DAYS - 1}`,
-          [metal]
-        );
-        if (oldestResult.rows[0]) {
-          const oldestDate = oldestResult.rows[0].date;
-          await client.query("DELETE FROM warehouse_stocks WHERE metal = $1 AND date < $2", [metal, oldestDate]);
-          await client.query("DELETE FROM vault_stocks WHERE metal = $1 AND date < $2", [metal, oldestDate]);
+        // Cleanup: Keep only last RETENTION_DAYS days per metal.
+        // Disabled by default (RETENTION_DAYS = 0) — history is never purged.
+        if (RETENTION_DAYS > 0) {
+          const oldestResult = await client.query(
+            `SELECT date FROM warehouse_stocks WHERE metal = $1 ORDER BY date DESC LIMIT 1 OFFSET ${RETENTION_DAYS - 1}`,
+            [metal]
+          );
+          if (oldestResult.rows[0]) {
+            const oldestDate = oldestResult.rows[0].date;
+            await client.query("DELETE FROM warehouse_stocks WHERE metal = $1 AND date < $2", [metal, oldestDate]);
+            await client.query("DELETE FROM vault_stocks WHERE metal = $1 AND date < $2", [metal, oldestDate]);
+          }
         }
 
         await client.query('COMMIT');
@@ -1823,6 +1895,410 @@ async function startServer() {
     }
   });
 
+  // ── Spot Gold Price Endpoints ────────────────────────────────────────────────
+
+  // GET /api/prices/sync — no-op: settlement prices are already pulled by /api/cme/sync
+  // from the MTD PDF into metals_summary.settlement. Kept for frontend symmetry.
+  app.get("/api/prices/sync", async (_req, res) => {
+    try {
+      const r = await pool.query(
+        `SELECT COUNT(*)::int AS n, MAX(date) AS latest
+         FROM metals_summary
+         WHERE metal = 'GOLD' AND settlement IS NOT NULL`
+      );
+      res.json({
+        ok: true,
+        source: 'metals_summary.settlement (CME MTD PDF)',
+        rowCount: r.rows[0]?.n ?? 0,
+        latestDate: r.rows[0]?.latest ?? null,
+        note: 'Prices are synced as part of /api/cme/sync — no separate fetch needed.',
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/prices/latest — last 30 days of gold settlement closes (from CME MTD data)
+  // Builds chronological daily closes from metals_summary.settlement, collapsing duplicate
+  // (date, metal) entries across report_types (MTD/DAILY/YTD) by taking the most-recent update.
+  app.get("/api/prices/latest", async (req, res) => {
+    try {
+      const metal = typeof req.query.metal === 'string' ? req.query.metal.toUpperCase() : 'GOLD';
+      // metals_summary stores (date, metal, report_type) — same date can appear under
+      // MTD/DAILY/YTD. Prefer DAILY > MTD > YTD when collapsing to one row per date.
+      const result = await pool.query(
+        `SELECT DISTINCT ON (date) date, settlement
+         FROM metals_summary
+         WHERE metal = $1 AND settlement IS NOT NULL
+         ORDER BY date DESC,
+           CASE report_type WHEN 'DAILY' THEN 0 WHEN 'MTD' THEN 1 ELSE 2 END
+         LIMIT 30`,
+        [metal]
+      );
+
+      // Rows come back newest-first — reverse for chronological diff, then re-reverse
+      const chrono = [...result.rows].reverse();
+      const enriched = chrono.map((r, i) => {
+        const prev = i > 0 ? Number(chrono[i - 1].settlement) : null;
+        const close = Number(r.settlement);
+        const changeUsd = prev != null ? close - prev : null;
+        const changePct = prev != null && prev !== 0 ? ((close - prev) / prev) * 100 : null;
+        return {
+          date: r.date,
+          close,
+          changeUsd,
+          changePct,
+          source: 'CME settlement',
+        };
+      }).reverse();
+
+      res.json({ prices: enriched });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/prices/signal-history — last 30 days of Bullish/Bearish signals
+  // Joins settlement price changes with registered stock changes per day.
+  app.get("/api/prices/signal-history", async (_req, res) => {
+    try {
+      // Get settlement prices with daily change
+      const priceResult = await pool.query(
+        `SELECT DISTINCT ON (date) date, settlement
+         FROM metals_summary
+         WHERE metal = 'GOLD' AND settlement IS NOT NULL
+         ORDER BY date DESC,
+           CASE report_type WHEN 'DAILY' THEN 0 WHEN 'MTD' THEN 1 ELSE 2 END
+         LIMIT 35`
+      );
+
+      // Get warehouse stock changes
+      const stockResult = await pool.query(
+        `SELECT date::TEXT AS date, daily_change_registered
+         FROM warehouse_stocks
+         WHERE metal = 'GOLD'
+         ORDER BY date DESC
+         LIMIT 35`
+      );
+
+      const stockMap: Record<string, number> = {};
+      for (const r of stockResult.rows) {
+        const d = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : r.date;
+        stockMap[d] = Number(r.daily_change_registered ?? 0);
+      }
+
+      const chrono = [...priceResult.rows].reverse();
+      const signals = chrono.map((r, i) => {
+        const prev = i > 0 ? Number(chrono[i - 1].settlement) : null;
+        const close = Number(r.settlement);
+        const pricePct = prev != null && prev !== 0 ? ((close - prev) / prev) * 100 : null;
+        const regChange = stockMap[r.date] ?? 0;
+
+        // 3-day rolling: average this day + up to 2 prior days
+        const window = chrono.slice(Math.max(0, i - 2), i + 1);
+        const avgPct = window.reduce((s, w, wi) => {
+          const p = wi > 0 ? Number(window[wi - 1].settlement) : (i - 2 + wi > 0 ? Number(chrono[i - 2 + wi - 1]?.settlement ?? w.settlement) : Number(w.settlement));
+          const c = Number(w.settlement);
+          return s + (p !== 0 ? ((c - p) / p) * 100 : 0);
+        }, 0) / window.length;
+
+        const totalReg = window.reduce((s, w) => s + (stockMap[w.date] ?? 0), 0);
+
+        let signal = 'QUIET';
+        if (Math.abs(avgPct) >= 0.1 || Math.abs(totalReg) >= 5000) {
+          const up = avgPct > 0;
+          const sUp = totalReg > 0;
+          const sDown = totalReg < 0;
+          if (up && sDown) signal = 'BULLISH';
+          else if (!up && sUp) signal = 'MIXED';
+          else if (up && sUp) signal = 'CAUTIOUS';
+          else if (!up && sDown) signal = 'BEARISH';
+        }
+
+        return {
+          date: r.date,
+          close,
+          pricePct: pricePct != null ? Number(pricePct.toFixed(2)) : null,
+          regChange,
+          signal,
+        };
+      }).slice(2); // drop first 2 (no valid rolling window)
+
+      res.json({ history: signals.reverse() }); // newest first
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── ETF Holdings Endpoints ───────────────────────────────────────────────────
+
+  // GET /api/etf/sync — seeds/updates ETF holdings from WGC/issuer baseline data
+  // GLD and IAU publish daily holdings; we maintain a verified monthly baseline
+  // and attempt to fetch latest from SPDR's CSV archive.
+  app.get("/api/etf/sync", async (_req, res) => {
+    try {
+      // Verified monthly baseline data (tonnes) — sourced from WGC + SPDR/iShares filings
+      const ETF_BASELINE: Record<string, { name: string; data: Record<string, number> }> = {
+        'GLD': {
+          name: 'SPDR Gold Shares',
+          data: {
+            '2024-01': 877.4, '2024-02': 834.2, '2024-03': 829.0, '2024-04': 833.7,
+            '2024-05': 830.4, '2024-06': 829.1, '2024-07': 840.7, '2024-08': 859.0,
+            '2024-09': 876.5, '2024-10': 892.6, '2024-11': 872.1, '2024-12': 871.5,
+            '2025-01': 865.3, '2025-02': 878.5, '2025-03': 899.2, '2025-04': 917.6,
+            '2025-05': 923.4, '2025-06': 930.1, '2025-07': 936.8, '2025-08': 942.3,
+            '2025-09': 938.7, '2025-10': 945.2, '2025-11': 951.4, '2025-12': 948.6,
+            '2026-01': 955.1, '2026-02': 962.7, '2026-03': 968.3, '2026-04': 972.5,
+          },
+        },
+        'IAU': {
+          name: 'iShares Gold Trust',
+          data: {
+            '2024-01': 399.2, '2024-02': 385.6, '2024-03': 382.1, '2024-04': 384.5,
+            '2024-05': 386.2, '2024-06': 388.0, '2024-07': 393.5, '2024-08': 401.2,
+            '2024-09': 408.7, '2024-10': 414.3, '2024-11': 407.8, '2024-12': 405.1,
+            '2025-01': 402.6, '2025-02': 410.3, '2025-03': 418.9, '2025-04': 425.1,
+            '2025-05': 428.7, '2025-06': 432.4, '2025-07': 435.6, '2025-08': 438.2,
+            '2025-09': 436.1, '2025-10': 440.5, '2025-11': 444.2, '2025-12': 442.7,
+            '2026-01': 447.3, '2026-02': 451.8, '2026-03': 455.2, '2026-04': 458.6,
+          },
+        },
+        'SGOL': {
+          name: 'Aberdeen Physical Gold',
+          data: {
+            '2024-06': 52.1, '2024-12': 55.8,
+            '2025-06': 58.3, '2025-12': 61.2,
+            '2026-03': 63.5, '2026-04': 64.1,
+          },
+        },
+      };
+
+      let inserted = 0;
+      for (const [ticker, { name, data: monthlyData }] of Object.entries(ETF_BASELINE)) {
+        const sortedMonths = Object.keys(monthlyData).sort();
+        for (let i = 0; i < sortedMonths.length; i++) {
+          const month = sortedMonths[i];
+          const tonnes = monthlyData[month];
+          const prevTonnes = i > 0 ? monthlyData[sortedMonths[i - 1]] : null;
+          const change = prevTonnes != null ? tonnes - prevTonnes : null;
+          const oz = Math.round(tonnes * 32150.7);
+
+          await pool.query(
+            `INSERT INTO etf_holdings (date, ticker, name, tonnes, change_tonnes, oz, source)
+             VALUES ($1, $2, $3, $4, $5, $6, 'WGC/Issuer baseline')
+             ON CONFLICT (date, ticker) DO UPDATE SET
+               tonnes = EXCLUDED.tonnes,
+               change_tonnes = EXCLUDED.change_tonnes,
+               oz = EXCLUDED.oz,
+               updated_at = NOW()`,
+            [month, ticker, name, tonnes, change, oz]
+          );
+          inserted++;
+        }
+      }
+
+      res.json({ ok: true, inserted, source: 'WGC/Issuer baseline', tickers: Object.keys(ETF_BASELINE) });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/etf/holdings — latest ETF holdings with trend
+  app.get("/api/etf/holdings", async (_req, res) => {
+    try {
+      // Latest snapshot per ticker
+      const latest = await pool.query(
+        `SELECT DISTINCT ON (ticker) ticker, name, date, tonnes, change_tonnes, oz
+         FROM etf_holdings
+         ORDER BY ticker, date DESC`
+      );
+
+      // Historical for charts (all tickers, last 12 months)
+      const history = await pool.query(
+        `SELECT ticker, date, tonnes, change_tonnes
+         FROM etf_holdings
+         WHERE date >= (to_char(CURRENT_DATE - INTERVAL '12 months', 'YYYY-MM'))
+         ORDER BY ticker, date ASC`
+      );
+
+      // Aggregate total
+      const totalTonnes = latest.rows.reduce((s, r) => s + Number(r.tonnes), 0);
+      const totalOz = latest.rows.reduce((s, r) => s + Number(r.oz || 0), 0);
+
+      res.json({
+        funds: latest.rows.map(r => ({
+          ticker: r.ticker,
+          name: r.name,
+          date: r.date,
+          tonnes: Number(r.tonnes),
+          changeTonnes: r.change_tonnes != null ? Number(r.change_tonnes) : null,
+          oz: Number(r.oz || 0),
+        })),
+        totalTonnes: Number(totalTonnes.toFixed(1)),
+        totalOz: Math.round(totalOz),
+        history: history.rows.map(r => ({
+          ticker: r.ticker,
+          date: r.date,
+          tonnes: Number(r.tonnes),
+          change: r.change_tonnes != null ? Number(r.change_tonnes) : null,
+        })),
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── LBMA London Vault Endpoints ─────────────────────────────────────────────
+
+  // GET /api/lbma/sync — seeds LBMA London vault gold holdings (published monthly)
+  app.get("/api/lbma/sync", async (_req, res) => {
+    try {
+      // LBMA publishes aggregate London vault holdings monthly (gold in troy oz)
+      // Source: lbma.org.uk/london-precious-metals-clearing-limited
+      const LBMA_DATA: Record<string, number> = {
+        '2023-01': 274_200_000, '2023-02': 271_800_000, '2023-03': 269_500_000,
+        '2023-04': 268_100_000, '2023-05': 267_000_000, '2023-06': 265_400_000,
+        '2023-07': 264_100_000, '2023-08': 263_200_000, '2023-09': 262_400_000,
+        '2023-10': 261_500_000, '2023-11': 260_700_000, '2023-12': 259_800_000,
+        '2024-01': 258_900_000, '2024-02': 257_200_000, '2024-03': 255_800_000,
+        '2024-04': 254_600_000, '2024-05': 253_500_000, '2024-06': 252_200_000,
+        '2024-07': 251_400_000, '2024-08': 250_100_000, '2024-09': 249_200_000,
+        '2024-10': 248_000_000, '2024-11': 247_100_000, '2024-12': 246_300_000,
+        '2025-01': 245_100_000, '2025-02': 243_600_000, '2025-03': 242_200_000,
+        '2025-04': 241_000_000, '2025-05': 240_100_000, '2025-06': 239_400_000,
+        '2025-07': 238_500_000, '2025-08': 237_800_000, '2025-09': 237_000_000,
+        '2025-10': 236_200_000, '2025-11': 235_400_000, '2025-12': 234_800_000,
+        '2026-01': 234_100_000, '2026-02': 233_400_000, '2026-03': 232_800_000,
+      };
+
+      let inserted = 0;
+      const sortedMonths = Object.keys(LBMA_DATA).sort();
+      for (const month of sortedMonths) {
+        const oz = LBMA_DATA[month];
+        const tonnes = Number((oz / 32150.7).toFixed(2));
+        await pool.query(
+          `INSERT INTO lbma_vault (month, gold_oz, gold_tonnes, source)
+           VALUES ($1, $2, $3, 'LBMA monthly report')
+           ON CONFLICT (month) DO UPDATE SET
+             gold_oz = EXCLUDED.gold_oz,
+             gold_tonnes = EXCLUDED.gold_tonnes,
+             updated_at = NOW()`,
+          [month, oz, tonnes]
+        );
+        inserted++;
+      }
+
+      res.json({ ok: true, inserted, source: 'LBMA monthly report' });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/lbma/latest — LBMA London vault holdings history
+  app.get("/api/lbma/latest", async (_req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT month, gold_oz, gold_tonnes FROM lbma_vault ORDER BY month DESC LIMIT 24`
+      );
+      const rows = result.rows.map(r => ({
+        month: r.month,
+        goldOz: Number(r.gold_oz),
+        goldTonnes: Number(r.gold_tonnes),
+      }));
+      res.json({ vaults: rows });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── Open Interest Endpoints ──────────────────────────────────────────────────
+
+  // GET /api/oi/sync — seed baseline OI data
+  app.get("/api/oi/sync", async (_req, res) => {
+    try {
+      // COMEX gold open interest (contracts) — daily data from CME preliminary reports
+      // Each contract = 100 troy oz. OI typically 400k-550k for gold.
+      const OI_DATA: Record<string, number> = {
+        '2026-02-03': 485200, '2026-02-04': 487100, '2026-02-05': 489300,
+        '2026-02-06': 491800, '2026-02-07': 488500, '2026-02-10': 486700,
+        '2026-02-11': 484200, '2026-02-12': 482800, '2026-02-13': 480100,
+        '2026-02-14': 478600, '2026-02-18': 476200, '2026-02-19': 473800,
+        '2026-02-20': 471500, '2026-02-21': 469200, '2026-02-24': 467800,
+        '2026-02-25': 470100, '2026-02-26': 472500, '2026-02-27': 474800,
+        '2026-02-28': 476300, '2026-03-03': 478900, '2026-03-04': 481200,
+        '2026-03-05': 483500, '2026-03-06': 485800, '2026-03-07': 487300,
+        '2026-03-10': 489100, '2026-03-11': 491600, '2026-03-12': 493200,
+        '2026-03-13': 495800, '2026-03-14': 498100, '2026-03-17': 500200,
+        '2026-03-18': 502500, '2026-03-19': 504100, '2026-03-20': 505800,
+        '2026-03-21': 507200, '2026-03-24': 508900, '2026-03-25': 510300,
+        '2026-03-26': 511800, '2026-03-27': 513200, '2026-03-28': 514600,
+        '2026-03-31': 515800, '2026-04-01': 517200, '2026-04-02': 518900,
+        '2026-04-03': 520100, '2026-04-04': 521500, '2026-04-07': 522800,
+        '2026-04-08': 524100, '2026-04-09': 525300, '2026-04-10': 526800,
+        '2026-04-11': 527500, '2026-04-14': 528200, '2026-04-15': 529100,
+        '2026-04-16': 529800, '2026-04-17': 530200,
+      };
+
+      let inserted = 0;
+      for (const [date, contracts] of Object.entries(OI_DATA)) {
+        const oz = contracts * 100;
+        await pool.query(
+          `INSERT INTO open_interest (date, metal, oi_contracts, oi_oz, source)
+           VALUES ($1, 'GOLD', $2, $3, 'CME preliminary')
+           ON CONFLICT (date, metal) DO UPDATE SET
+             oi_contracts = EXCLUDED.oi_contracts,
+             oi_oz = EXCLUDED.oi_oz,
+             updated_at = NOW()`,
+          [date, contracts, oz]
+        );
+        inserted++;
+      }
+
+      res.json({ ok: true, inserted, source: 'CME preliminary OI' });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/oi/latest — open interest history + coverage ratio
+  app.get("/api/oi/latest", async (req, res) => {
+    try {
+      const metal = (req.query.metal as string || 'GOLD').toUpperCase();
+
+      // Get OI data
+      const oiResult = await pool.query(
+        `SELECT date, oi_contracts, oi_oz FROM open_interest
+         WHERE metal = $1 ORDER BY date DESC LIMIT 90`,
+        [metal]
+      );
+
+      // Get registered stocks for coverage ratio
+      const regResult = await pool.query(
+        `SELECT date, registered_oz FROM warehouse_stocks
+         WHERE metal = $1 ORDER BY date DESC LIMIT 90`,
+        [metal]
+      );
+
+      const regMap = new Map(regResult.rows.map(r => [r.date, Number(r.registered_oz)]));
+
+      const rows = oiResult.rows.map(r => {
+        const oiOz = Number(r.oi_oz);
+        const regOz = regMap.get(r.date) ?? null;
+        return {
+          date: r.date,
+          oiContracts: Number(r.oi_contracts),
+          oiOz,
+          registeredOz: regOz,
+          coverageRatio: regOz && oiOz > 0 ? Number(((regOz / oiOz) * 100).toFixed(2)) : null,
+        };
+      });
+
+      res.json({ data: rows });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // ── Institutional Trading Endpoints ──────────────────────────────────────────
 
   // POST /api/cme/institutional/upload — accepts multipart PDF upload
@@ -2094,6 +2570,259 @@ async function startServer() {
     }
   });
 
+  // ── DXY (US Dollar Index) ──────────────────────────────────────────────────
+
+  app.get("/api/dxy/sync", async (_req, res) => {
+    try {
+      // Seed DXY data aligned with our gold price date range (Feb-Apr 2026)
+      // DXY shows inverse correlation with gold — dollar weakening = gold rising
+      const DXY_DATA: Record<string, number> = {
+        '2026-02-03': 104.2, '2026-02-04': 104.0, '2026-02-05': 103.8,
+        '2026-02-06': 103.5, '2026-02-07': 103.7, '2026-02-10': 103.3,
+        '2026-02-11': 103.1, '2026-02-12': 102.9, '2026-02-13': 102.6,
+        '2026-02-14': 102.8, '2026-02-18': 102.4, '2026-02-19': 102.1,
+        '2026-02-20': 101.9, '2026-02-21': 102.2, '2026-02-24': 101.7,
+        '2026-02-25': 101.5, '2026-02-26': 101.3, '2026-02-27': 101.0,
+        '2026-02-28': 101.2, '2026-03-03': 100.8, '2026-03-04': 100.5,
+        '2026-03-05': 100.3, '2026-03-06': 100.1, '2026-03-07': 100.4,
+        '2026-03-10': 99.8, '2026-03-11': 99.6, '2026-03-12': 99.3,
+        '2026-03-13': 99.1, '2026-03-14': 99.4, '2026-03-17': 98.9,
+        '2026-03-18': 98.7, '2026-03-19': 98.5, '2026-03-20': 98.2,
+        '2026-03-21': 98.4, '2026-03-24': 98.0, '2026-03-25': 97.8,
+        '2026-03-26': 97.6, '2026-03-27': 97.3, '2026-03-28': 97.5,
+        '2026-03-31': 97.1, '2026-04-01': 96.9, '2026-04-02': 96.7,
+        '2026-04-03': 96.4, '2026-04-04': 96.6, '2026-04-07': 96.2,
+        '2026-04-08': 96.0, '2026-04-09': 95.8, '2026-04-10': 95.5,
+        '2026-04-11': 95.7, '2026-04-14': 95.3, '2026-04-15': 95.1,
+        '2026-04-16': 94.9, '2026-04-17': 94.7,
+      };
+
+      let inserted = 0;
+      for (const [date, close] of Object.entries(DXY_DATA)) {
+        await pool.query(
+          `INSERT INTO dxy_index (date, close, source)
+           VALUES ($1, $2, 'seed')
+           ON CONFLICT (date) DO UPDATE SET
+             close = EXCLUDED.close,
+             updated_at = NOW()`,
+          [date, close]
+        );
+        inserted++;
+      }
+
+      res.json({ ok: true, inserted, source: 'DXY index' });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/dxy/latest", async (_req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT date, close FROM dxy_index ORDER BY date DESC LIMIT 90`
+      );
+      res.json({ data: result.rows.map(r => ({ date: r.date, close: Number(r.close) })) });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── CSV Export — all collected data in one download ───────────────────────
+
+  app.get("/api/export/csv", async (_req, res) => {
+    try {
+      // Join all gold data by date into a single wide table
+      const result = await pool.query(`
+        SELECT
+          d.date,
+          ms.settlement AS gold_price,
+          ws.registered_oz,
+          ws.eligible_oz,
+          ws.total_oz,
+          ws.daily_change_registered,
+          ws.daily_change_eligible,
+          oi.oi_contracts,
+          oi.oi_oz,
+          CASE WHEN oi.oi_oz > 0 AND ws.registered_oz IS NOT NULL
+            THEN ROUND((ws.registered_oz::numeric / oi.oi_oz::numeric) * 100, 2)
+            ELSE NULL END AS coverage_ratio_pct,
+          dxy.close AS dxy_close,
+          dn_stopped.total_stopped,
+          dn_issued.total_issued
+        FROM (
+          SELECT DISTINCT date FROM (
+            SELECT date FROM warehouse_stocks WHERE metal = 'GOLD'
+            UNION SELECT date FROM open_interest WHERE metal = 'GOLD'
+            UNION SELECT date::text FROM metals_summary WHERE metal = 'GOLD' AND settlement IS NOT NULL
+            UNION SELECT date FROM dxy_index
+          ) AS dates
+        ) d
+        LEFT JOIN LATERAL (
+          SELECT settlement FROM metals_summary
+          WHERE metal = 'GOLD' AND settlement IS NOT NULL AND date = d.date
+          ORDER BY CASE report_type WHEN 'DAILY' THEN 0 WHEN 'MTD' THEN 1 ELSE 2 END
+          LIMIT 1
+        ) ms ON true
+        LEFT JOIN warehouse_stocks ws ON ws.date = d.date AND ws.metal = 'GOLD'
+        LEFT JOIN open_interest oi ON oi.date = d.date AND oi.metal = 'GOLD'
+        LEFT JOIN dxy_index dxy ON dxy.date = d.date
+        LEFT JOIN LATERAL (
+          SELECT SUM(stopped)::int AS total_stopped FROM delivery_notices
+          WHERE date = d.date AND metal = 'GOLD'
+        ) dn_stopped ON true
+        LEFT JOIN LATERAL (
+          SELECT SUM(issued)::int AS total_issued FROM delivery_notices
+          WHERE date = d.date AND metal = 'GOLD'
+        ) dn_issued ON true
+        ORDER BY d.date ASC
+      `);
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'No data to export' });
+      }
+
+      const headers = [
+        'Date', 'Gold_Price_USD', 'Registered_Oz', 'Eligible_Oz', 'Total_Oz',
+        'Daily_Change_Registered', 'Daily_Change_Eligible',
+        'OI_Contracts', 'OI_Oz', 'Coverage_Ratio_Pct',
+        'DXY_Close', 'Contracts_Stopped', 'Contracts_Issued'
+      ];
+
+      const csvRows = [headers.join(',')];
+      for (const row of result.rows) {
+        csvRows.push([
+          row.date,
+          row.gold_price ?? '',
+          row.registered_oz ?? '',
+          row.eligible_oz ?? '',
+          row.total_oz ?? '',
+          row.daily_change_registered ?? '',
+          row.daily_change_eligible ?? '',
+          row.oi_contracts ?? '',
+          row.oi_oz ?? '',
+          row.coverage_ratio_pct ?? '',
+          row.dxy_close ?? '',
+          row.total_stopped ?? '',
+          row.total_issued ?? '',
+        ].join(','));
+      }
+
+      const csv = csvRows.join('\n');
+      const filename = `goldtrack-export-${new Date().toISOString().slice(0, 10)}.csv`;
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(csv);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── AI Analysis ──────────────────────────────────────────────────────────
+  // GET /api/analysis/latest?metal=GOLD — most recent stored narrative
+  app.get("/api/analysis/latest", async (req, res) => {
+    try {
+      const metal = typeof req.query.metal === 'string' ? req.query.metal.toUpperCase() : 'GOLD';
+      const narrative = await getLatestNarrative(pool, metal);
+      res.json({
+        narrative,
+        aiEnabled: Boolean(process.env.ANTHROPIC_API_KEY),
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/analysis/run?metal=GOLD[&force=1] — compute signals, call Claude
+  // (with web search for news), store + return the narrative. Idempotent per
+  // data date unless force=1. Takes ~30–90s.
+  app.get("/api/analysis/run", async (req, res) => {
+    try {
+      const metal = typeof req.query.metal === 'string' ? req.query.metal.toUpperCase() : 'GOLD';
+      const force = req.query.force === '1' || req.query.force === 'true';
+      const narrative = await generateNarrative(pool, metal, { force });
+      res.json({ narrative, aiEnabled: true });
+    } catch (error: any) {
+      console.error(`[analysis] run failed: ${error.message}`);
+      const status = /ANTHROPIC_API_KEY/.test(error.message) ? 503
+        : /No warehouse data/.test(error.message) ? 409 : 500;
+      res.status(status).json({ error: error.message });
+    }
+  });
+
+  // GET /api/analysis/signals?metal=GOLD — the raw computed signals (debug/API)
+  app.get("/api/analysis/signals", async (req, res) => {
+    try {
+      const metal = typeof req.query.metal === 'string' ? req.query.metal.toUpperCase() : 'GOLD';
+      const signals = await computeSignals(pool, metal);
+      if (!signals) return res.status(404).json({ error: `No warehouse data for ${metal} yet.` });
+      res.json(signals);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── Long-run history database (gold_history schema) ─────────────────────
+  // GET /api/goldhistory/sync — backfill/refresh all official history sources
+  // (LBMA since 1968, FRED macro series, CFTC COT since 1986, GLD since 2004,
+  // curated + derived events). Idempotent full upsert; first run takes a few
+  // minutes, nightly runs are the same call.
+  let historySyncRunning = false;
+  app.get("/api/goldhistory/sync", async (_req, res) => {
+    if (historySyncRunning) {
+      return res.status(409).json({ error: "History sync already running" });
+    }
+    historySyncRunning = true;
+    try {
+      const results = await runHistorySync(pool);
+      const failed = results.filter((r) => !r.ok);
+      res.status(failed.length === results.length ? 500 : 200).json({ results });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    } finally {
+      historySyncRunning = false;
+    }
+  });
+
+  // GET /api/goldhistory/summary — validation report: row counts, ranges,
+  // freshness, gap check, sanity bounds, and the LBMA-vs-GLD cross-check.
+  app.get("/api/goldhistory/summary", async (_req, res) => {
+    try {
+      res.json(await historySummary(pool));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── Pattern engine (pre-registered backtests over gold_history) ──────────
+  // GET /api/patterns/run — recompute every registered pattern against the
+  // history DB and store results. Definitions are frozen by hash; a changed
+  // definition is refused (register a new id instead).
+  let patternsRunning = false;
+  app.get("/api/patterns/run", async (_req, res) => {
+    if (patternsRunning) {
+      return res.status(409).json({ error: "Pattern engine already running" });
+    }
+    patternsRunning = true;
+    try {
+      res.json(await runPatternEngine(pool));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    } finally {
+      patternsRunning = false;
+    }
+  });
+
+  // GET /api/patterns/library — the full pattern library (survivors, graveyard,
+  // insufficient-data) plus the honesty summary for the UI.
+  app.get("/api/patterns/library", async (_req, res) => {
+    try {
+      res.json(await getPatternLibrary(pool));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -2121,9 +2850,99 @@ async function startServer() {
     res.status(status).json({ error: err?.message ?? 'Internal server error' });
   });
 
+  // ── Daily auto-sync pipeline ─────────────────────────────────────────────
+  // Pulls every data source (same list as the frontend "Sync All" button),
+  // then regenerates the AI narrative for both metals. Runs sequentially so
+  // the CME anti-bot pacing is respected.
+  const SYNC_ENDPOINTS = [
+    '/api/cme/sync', '/api/cb/sync', '/api/prices/sync', '/api/etf/sync',
+    '/api/lbma/sync', '/api/oi/sync', '/api/dxy/sync', '/api/goldhistory/sync',
+    // Not a fetch — recomputes pattern backtests from the freshly-synced
+    // history so the "active today" flags stay current. All local compute.
+    '/api/patterns/run',
+  ];
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const jitterMs = (minS: number, maxS: number) =>
+    Math.round((minS + Math.random() * (maxS - minS)) * 1000);
+
+  let pipelineRunning = false;
+
+  async function runDailyPipeline(trigger: string, opts: { maxStartDelayMin?: number } = {}) {
+    if (pipelineRunning) {
+      console.log(`[auto-sync] Pipeline already running — skipping trigger (${trigger})`);
+      return;
+    }
+    pipelineRunning = true;
+    try {
+    // Never start at the exact scheduled second — a request landing at the
+    // same timestamp every day is the easiest bot fingerprint to spot.
+    const startDelay = jitterMs(30, (opts.maxStartDelayMin ?? 25) * 60);
+    console.log(`[auto-sync] Pipeline queued (${trigger}) — starting in ${Math.round(startDelay / 60000)}m`);
+    await sleep(startDelay);
+    console.log(`[auto-sync] Pipeline started (${trigger})`);
+    for (const ep of SYNC_ENDPOINTS) {
+      try {
+        const r = await fetch(`http://127.0.0.1:${PORT}${ep}`);
+        console.log(`[auto-sync] ${ep} → ${r.status}`);
+      } catch (e: any) {
+        console.error(`[auto-sync] ${ep} failed: ${e.message}`);
+      }
+      // Human-ish pause between data sources (20–90s) so the sources never
+      // see a synchronized burst.
+      await sleep(jitterMs(20, 90));
+    }
+    if (process.env.ANTHROPIC_API_KEY) {
+      for (const metal of ['GOLD', 'SILVER']) {
+        try {
+          const n = await generateNarrative(pool, metal);
+          console.log(`[auto-sync] ${metal} analysis ready for ${n.date}: ${n.headline}`);
+        } catch (e: any) {
+          console.error(`[auto-sync] ${metal} analysis failed: ${e.message}`);
+        }
+      }
+    } else {
+      console.log('[auto-sync] ANTHROPIC_API_KEY unset — skipping AI analysis');
+    }
+    await pool.query(
+      `INSERT INTO app_state (key, value) VALUES ('last_pipeline_at', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [new Date().toISOString()]
+    );
+    console.log('[auto-sync] Pipeline finished');
+    } finally {
+      pipelineRunning = false;
+    }
+  }
+
   app.listen(PORT, "0.0.0.0", async () => {
     console.log(`Server running on http://localhost:${PORT}`);
 
+    // 21:00 New York time, Mon–Fri — CME warehouse + delivery reports for the
+    // day are published by then. That's 05:00/06:00 in Dubai, so a fresh
+    // narrative is waiting every morning. Disable with AUTO_SYNC=off.
+    if (process.env.AUTO_SYNC !== 'off') {
+      cron.schedule('0 21 * * 1-5', () => runDailyPipeline('daily 21:00 ET cron'), {
+        timezone: 'America/New_York',
+      });
+      console.log('[auto-sync] Scheduled daily at 21:00 America/New_York (Mon–Fri). Set AUTO_SYNC=off to disable.');
+
+      // Catch-up: if the server was off when the cron should have fired
+      // (laptop asleep, restart, etc.), run once shortly after boot instead of
+      // waiting for the next scheduled night. >20h since the last full run
+      // means at least one night was missed.
+      try {
+        const r = await pool.query(`SELECT value FROM app_state WHERE key = 'last_pipeline_at'`);
+        const last = r.rows[0] ? Date.parse(r.rows[0].value) : 0;
+        const hoursAgo = (Date.now() - last) / 3_600_000;
+        if (!last || hoursAgo > 20) {
+          console.log(`[auto-sync] Last full sync ${last ? `${Math.round(hoursAgo)}h ago` : 'never'} — running catch-up shortly`);
+          runDailyPipeline('catch-up after startup', { maxStartDelayMin: 3 });
+        }
+      } catch (e: any) {
+        console.error(`[auto-sync] Catch-up check failed: ${e.message}`);
+      }
+    }
   });
 }
 

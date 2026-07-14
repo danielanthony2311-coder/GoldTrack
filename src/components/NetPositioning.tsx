@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { ArrowUpRight, ArrowDownRight, Minus, Shield, Building2 } from 'lucide-react';
+import { ArrowUpRight, ArrowDownRight, Minus, Shield, Building2, Info } from 'lucide-react';
 import { cn } from '../utils/cn';
 
 interface Notice {
@@ -99,7 +99,17 @@ export default function NetPositioning() {
     <div className="glass-card p-6 bg-[#121212] border-[#333] rounded-2xl w-full">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h3 className="text-xl font-black text-zinc-100 tracking-tight">Net Positioning</h3>
+          <div className="flex items-center gap-2">
+            <h3 className="text-xl font-black text-zinc-100 tracking-tight">Net Positioning</h3>
+            <div className="group relative">
+              <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+              <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                <p className="mb-2"><strong>Stopped</strong> = buyer taking physical delivery. <strong>Issued</strong> = seller delivering metal out.</p>
+                <p className="mb-2"><strong>House accounts</strong> (H) = the bank's own money. This is the strongest signal — dealers positioning for themselves means conviction.</p>
+                <p><strong>Customer accounts</strong> (C) = client orders. Could be hedging or speculative — less directional. When house accounts are net buying, that's bullish.</p>
+              </div>
+            </div>
+          </div>
           <p className="text-zinc-500 text-xs font-medium uppercase tracking-widest mt-1">
             Who is buying vs selling — {reportDate}
           </p>

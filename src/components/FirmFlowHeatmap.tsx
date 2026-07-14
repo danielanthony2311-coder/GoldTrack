@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Flame, Snowflake, ArrowRight } from 'lucide-react';
+import { Flame, Snowflake, ArrowRight, Info } from 'lucide-react';
 import { cn } from '../utils/cn';
 
 interface FirmTotal {
@@ -147,7 +147,17 @@ export default function FirmFlowHeatmap({ metal = 'GOLD' }: { metal?: string }) 
     <div className="glass-card p-6 bg-[#121212] border-[#333] rounded-2xl w-full">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h3 className="text-xl font-black text-zinc-100 tracking-tight">Institutional Flow Tracker</h3>
+          <div className="flex items-center gap-2">
+            <h3 className="text-xl font-black text-zinc-100 tracking-tight">Institutional Flow Tracker</h3>
+            <div className="group relative">
+              <Info className="w-4 h-4 text-zinc-600 cursor-help" />
+              <div className="absolute top-full left-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
+                <p className="mb-2">Each cell shows a firm's <strong>net contracts</strong> for that day. Green = taking delivery (buying physical). Red = delivering out (selling).</p>
+                <p className="mb-2">Look for <strong>patterns</strong>: a row of consistent green means sustained accumulation. A sudden flip from green to red signals a positioning change.</p>
+                <p>The <strong>Leaderboard</strong> tab ranks firms by total net activity over the period. Watch for JP Morgan, Barclays, and Goldman — their house account moves often precede price moves.</p>
+              </div>
+            </div>
+          </div>
           <p className="text-zinc-500 text-xs font-medium uppercase tracking-widest mt-1">
             Who is accumulating vs distributing — Last {dates.length} trading days
           </p>
