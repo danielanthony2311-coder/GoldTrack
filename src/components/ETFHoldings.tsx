@@ -60,7 +60,7 @@ export default function ETFHoldings() {
     return (
       <div className="glass-card p-6">
         <h3 className="font-semibold text-lg mb-2">ETF Gold Holdings</h3>
-        <p className="text-sm text-zinc-500">No ETF data — click Sync All to fetch.</p>
+        <p className="text-sm text-zinc-500">No ETF data yet — fills automatically after the nightly sync.</p>
       </div>
     );
   }

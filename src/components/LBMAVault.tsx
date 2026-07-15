@@ -37,7 +37,7 @@ export default function LBMAVault() {
     return (
       <div className="glass-card p-6">
         <h3 className="font-semibold text-lg mb-2">London Vault Holdings (LBMA)</h3>
-        <p className="text-sm text-zinc-500">No data — click Sync All to fetch.</p>
+        <p className="text-sm text-zinc-500">No data yet — fills automatically after the nightly sync.</p>
       </div>
     );
   }

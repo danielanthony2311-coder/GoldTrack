@@ -75,7 +75,7 @@ export default function GoldVsDxy({ refreshKey }: Props) {
     return (
       <div className="glass-card p-6">
         <h3 className="font-semibold text-lg mb-2">Gold vs DXY</h3>
-        <p className="text-sm text-zinc-500">No data — click Sync All to fetch.</p>
+        <p className="text-sm text-zinc-500">No data yet — fills automatically after the nightly sync.</p>
       </div>
     );
   }

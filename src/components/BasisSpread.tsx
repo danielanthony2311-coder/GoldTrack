@@ -41,7 +41,7 @@ export default function BasisSpread() {
     return (
       <div className="glass-card p-6">
         <h3 className="font-semibold text-lg mb-2">Daily Price Momentum</h3>
-        <p className="text-sm text-zinc-500">Not enough data — click Sync All.</p>
+        <p className="text-sm text-zinc-500">Not enough data yet — accumulates with each nightly sync.</p>
       </div>
     );
   }

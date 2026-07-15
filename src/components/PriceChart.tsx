@@ -101,7 +101,7 @@ export default function PriceChart() {
           </div>
         ) : filtered.length === 0 ? (
           <div className="flex items-center justify-center h-full text-sm text-zinc-500">
-            No price data — click Sync All to fetch
+            No price data yet — fills automatically after the nightly sync
           </div>
         ) : (
           <ResponsiveContainer width="100%" height="100%">
