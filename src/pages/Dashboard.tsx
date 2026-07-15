@@ -9,6 +9,7 @@ import BasisSpread from '../components/BasisSpread';
 import AlertBanner from '../components/AlertBanner';
 import DailyBrief from '../components/DailyBrief';
 import MarketNarrative from '../components/MarketNarrative';
+import TightnessGauge from '../components/TightnessGauge';
 
 type Signal = 'BULLISH' | 'BEARISH' | 'CAUTIOUS' | 'MIXED' | 'QUIET';
 
@@ -206,6 +207,9 @@ export default function Dashboard() {
 
       {/* ─── ALERTS ─── */}
       <AlertBanner />
+
+      {/* ─── TIGHTNESS GAUGE (centerpiece) ─── */}
+      <TightnessGauge metal={metal} />
 
       {/* ─── AI INTERPRETATION ─── */}
       <MarketNarrative metal={metal} />

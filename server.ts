@@ -6,6 +6,7 @@ import pg from "pg";
 import axios from "axios";
 import cron from "node-cron";
 import { ensureAnalysisTables, generateNarrative, getLatestNarrative, computeSignals } from "./analysis.ts";
+import { ensureTightnessTables, computeTightness, runAndStoreTightness, getTightnessHistory } from "./tightness.ts";
 import { ensureHistoryTables, runHistorySync, historySummary } from "./history.ts";
 import { ensurePatternTables, runPatternEngine, getPatternLibrary } from "./patterns.ts";
 import * as XLSX from "xlsx";
@@ -898,6 +899,7 @@ async function startServer() {
   // Initialize database tables
   await initDb();
   await ensureAnalysisTables(pool);
+  await ensureTightnessTables(pool);
   await ensureHistoryTables(pool);
   await ensurePatternTables(pool);
   // Tiny key-value store for app bookkeeping (e.g. when the last full
@@ -2648,7 +2650,8 @@ async function startServer() {
             ELSE NULL END AS coverage_ratio_pct,
           dxy.close AS dxy_close,
           dn_stopped.total_stopped,
-          dn_issued.total_issued
+          dn_issued.total_issued,
+          td.score AS tightness_score
         FROM (
           SELECT DISTINCT date FROM (
             SELECT date FROM warehouse_stocks WHERE metal = 'GOLD'
@@ -2674,6 +2677,7 @@ async function startServer() {
           SELECT SUM(issued)::int AS total_issued FROM delivery_notices
           WHERE date = d.date AND metal = 'GOLD'
         ) dn_issued ON true
+        LEFT JOIN tightness_daily td ON td.date = d.date AND td.metal = 'GOLD'
         ORDER BY d.date ASC
       `);
 
@@ -2757,6 +2761,48 @@ async function startServer() {
       const signals = await computeSignals(pool, metal);
       if (!signals) return res.status(404).json({ error: `No warehouse data for ${metal} yet.` });
       res.json(signals);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ── Tightness gauge (0-100 physical tightness composite) ────────────────
+  // GET /api/tightness/latest?metal=GOLD — last stored score + 90d history
+  app.get("/api/tightness/latest", async (req, res) => {
+    try {
+      const metal = typeof req.query.metal === "string" ? req.query.metal.toUpperCase() : "GOLD";
+      const row = await pool.query(
+        `SELECT date, metal, score, confidence, zone, definition, components, created_at
+           FROM tightness_daily WHERE metal = $1 ORDER BY date DESC LIMIT 1`,
+        [metal]
+      );
+      if (!row.rows.length) return res.status(404).json({ error: `No tightness score stored for ${metal} yet. Run /api/tightness/run first.` });
+      const history = await getTightnessHistory(pool, metal, 90);
+      res.json({ ...row.rows[0], history });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/tightness/run?metal=GOLD — recompute from current data and store.
+  // All local compute; part of the nightly pipeline (after syncs).
+  app.get("/api/tightness/run", async (req, res) => {
+    try {
+      const metal = typeof req.query.metal === "string" ? req.query.metal.toUpperCase() : "";
+      const metals = metal ? [metal] : ["GOLD", "SILVER"];
+      const results = [];
+      for (const m of metals) results.push(await runAndStoreTightness(pool, m));
+      res.json(metals.length === 1 ? results[0] : { results });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/tightness/preview?metal=GOLD — compute without storing (debug)
+  app.get("/api/tightness/preview", async (req, res) => {
+    try {
+      const metal = typeof req.query.metal === "string" ? req.query.metal.toUpperCase() : "GOLD";
+      res.json(await computeTightness(pool, metal));
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -2860,6 +2906,8 @@ async function startServer() {
     // Not a fetch — recomputes pattern backtests from the freshly-synced
     // history so the "active today" flags stay current. All local compute.
     '/api/patterns/run',
+    // Local compute: daily tightness score from the freshly-synced data.
+    '/api/tightness/run',
   ];
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
