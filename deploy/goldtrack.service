@@ -1,0 +1,24 @@
+[Unit]
+Description=GoldTrack COMEX analytics server + nightly sync cron
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=goldtrack
+WorkingDirectory=/opt/goldtrack
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=AUTO_SYNC=on
+# Secrets (PG* + ANTHROPIC_API_KEY) are read from /opt/goldtrack/.env.local by
+# the app's own loadEnvFile(). The nightly pipeline (21:00 America/New_York,
+# Mon-Fri) only fires while this service is running, which is the whole point
+# of moving off the laptop.
+ExecStart=/usr/bin/npx tsx server.ts
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/goldtrack.log
+StandardError=append:/var/log/goldtrack.log
+
+[Install]
+WantedBy=multi-user.target

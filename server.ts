@@ -9,6 +9,8 @@ import { ensureAnalysisTables, generateNarrative, getLatestNarrative, computeSig
 import { ensureTightnessTables, computeTightness, runAndStoreTightness, getTightnessHistory } from "./tightness.ts";
 import { ensureHistoryTables, runHistorySync, historySummary } from "./history.ts";
 import { ensurePatternTables, runPatternEngine, getPatternLibrary } from "./patterns.ts";
+import { ensurePredictionTables, runPredictions, gradePredictions, getScoreboard, getActivePredictions, backfillFromBacktest } from "./predictions.ts";
+import { survivedEpisodeLedger } from "./patterns.ts";
 import * as XLSX from "xlsx";
 import fs from "fs";
 import { createRequire } from 'module';
@@ -902,6 +904,7 @@ async function startServer() {
   await ensureTightnessTables(pool);
   await ensureHistoryTables(pool);
   await ensurePatternTables(pool);
+  await ensurePredictionTables(pool);
   // Tiny key-value store for app bookkeeping (e.g. when the last full
   // auto-sync ran, so a missed night can be caught up on next boot).
   await pool.query(`
@@ -2869,6 +2872,49 @@ async function startServer() {
     }
   });
 
+  // ── Predictions & scoreboard (high-conviction alerts + graded track record) ──
+  // /run opens alerts for survived patterns active today; /grade settles matured
+  // ones against the LBMA fix. Both are in the nightly pipeline (local compute).
+  app.get("/api/predictions/run", async (_req, res) => {
+    try {
+      res.json(await runPredictions(pool));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+  app.get("/api/predictions/grade", async (_req, res) => {
+    try {
+      res.json(await gradePredictions(pool));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+  // /scoreboard = backtest odds + live hit-rate per pattern; /latest = open alerts + recent grades.
+  app.get("/api/predictions/scoreboard", async (_req, res) => {
+    try {
+      res.json(await getScoreboard(pool));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+  app.get("/api/predictions/latest", async (_req, res) => {
+    try {
+      res.json(await getActivePredictions(pool));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+  // /backfill materializes every historical firing of the survived patterns as a
+  // graded call (idempotent). Run once after go-live to populate the ledger.
+  app.get("/api/predictions/backfill", async (_req, res) => {
+    try {
+      const ledger = await survivedEpisodeLedger(pool);
+      res.json(await backfillFromBacktest(pool, ledger));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -2908,6 +2954,10 @@ async function startServer() {
     '/api/patterns/run',
     // Local compute: daily tightness score from the freshly-synced data.
     '/api/tightness/run',
+    // Local compute: open high-conviction alerts (survived patterns active today),
+    // then grade any that matured. Must follow patterns/run + goldhistory sync.
+    '/api/predictions/run',
+    '/api/predictions/grade',
   ];
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

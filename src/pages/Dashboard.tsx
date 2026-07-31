@@ -10,6 +10,7 @@ import AlertBanner from '../components/AlertBanner';
 import DailyBrief from '../components/DailyBrief';
 import MarketNarrative from '../components/MarketNarrative';
 import TightnessGauge from '../components/TightnessGauge';
+import PredictionsScoreboard from '../components/PredictionsScoreboard';
 
 type Signal = 'BULLISH' | 'BEARISH' | 'CAUTIOUS' | 'MIXED' | 'QUIET';
 
@@ -213,6 +214,9 @@ export default function Dashboard() {
 
       {/* ─── AI INTERPRETATION ─── */}
       <MarketNarrative metal={metal} />
+
+      {/* ─── PREDICTION SCOREBOARD (high-conviction alerts + graded track record) ─── */}
+      <PredictionsScoreboard metal={metal} />
 
       {/* ─── PRICE CHARTS ─── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

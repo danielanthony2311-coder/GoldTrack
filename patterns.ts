@@ -693,6 +693,44 @@ export async function runPatternEngine(pool: Pool) {
   return { asOf: lastDate, patterns: report };
 }
 
+// Per-episode ledger for SURVIVED patterns: every historical firing with its
+// graded outcome at the primary horizon. Uses the exact same episode grouping
+// (≥63td apart, next-day entry) as the backtest, so this ledger IS the backtest
+// made auditable, row by row. Feeds the predictions backfill.
+export async function survivedEpisodeLedger(pool: Pool) {
+  const survived = await pool.query(
+    `SELECT pattern_id FROM gold_history.pattern_stats WHERE status='SURVIVED' AND metal='GOLD'`
+  );
+  const ids = new Set(survived.rows.map((r: any) => r.pattern_id));
+  if (ids.size === 0) return [];
+  const ctx = await loadCtx(pool);
+  const out: any[] = [];
+  for (const hyp of HYPOTHESES) {
+    if (!ids.has(hyp.id)) continue;
+    const signal = hyp.build(ctx, hyp.params);
+    const episodes = measureEpisodes(ctx, episodeStarts(signal));
+    const ph = hyp.primaryHorizon;
+    for (const e of episodes) {
+      const ret = e.rets[ph];
+      if (ret === null) continue; // not matured — leave for the live path
+      const exitIdx = e.entryIdx + ph;
+      out.push({
+        patternId: hyp.id,
+        name: hyp.name,
+        direction: hyp.direction,
+        horizonDays: ph,
+        createdDate: e.date,
+        entryPrice: ctx.gold[e.entryIdx],
+        exitDate: ctx.timeline[exitIdx],
+        exitPrice: ctx.gold[exitIdx],
+        returnPct: Math.round(ret * 100) / 100,
+        hit: hyp.direction === "UP" ? ret > 0 : ret < 0,
+      });
+    }
+  }
+  return out;
+}
+
 export async function getPatternLibrary(pool: Pool) {
   const rows = await pool.query(`
     SELECT * FROM gold_history.pattern_stats
