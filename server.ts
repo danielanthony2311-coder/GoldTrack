@@ -1902,21 +1902,68 @@ async function startServer() {
 
   // ── Spot Gold Price Endpoints ────────────────────────────────────────────────
 
-  // GET /api/prices/sync — no-op: settlement prices are already pulled by /api/cme/sync
-  // from the MTD PDF into metals_summary.settlement. Kept for frontend symmetry.
+  // GET /api/prices/sync — REAL writer (2026-08-04): CME settlements from
+  // metals_summary into gold_prices, plus today's live spot (gold-api.com,
+  // free/keyless). Settlement wins over spot when both exist for a date.
   app.get("/api/prices/sync", async (_req, res) => {
     try {
-      const r = await pool.query(
-        `SELECT COUNT(*)::int AS n, MAX(date) AS latest
+      await pool.query(
+        `INSERT INTO gold_prices (date, spot_usd_close, source)
+         SELECT date::date, MAX(settlement), 'CME settlement (MTD PDF)'
          FROM metals_summary
-         WHERE metal = 'GOLD' AND settlement IS NOT NULL`
+         WHERE metal = 'GOLD' AND settlement IS NOT NULL
+         GROUP BY date
+         ON CONFLICT (date) DO UPDATE SET
+           spot_usd_close = EXCLUDED.spot_usd_close,
+           source = EXCLUDED.source,
+           updated_at = NOW()`
       );
+
+      let spotNote = 'skipped';
+      try {
+        const r = await fetch('https://api.gold-api.com/price/XAU', { headers: { Accept: 'application/json' } });
+        if (r.ok) {
+          const j: any = await r.json();
+          const price = Number(j?.price);
+          const day = String(j?.updatedAt || '').slice(0, 10) || new Date().toISOString().slice(0, 10);
+          if (Number.isFinite(price) && price > 0) {
+            await pool.query(
+              `INSERT INTO gold_prices (date, spot_usd_close, source)
+               VALUES ($1, $2, 'gold-api.com spot')
+               ON CONFLICT (date) DO UPDATE SET
+                 spot_usd_close = EXCLUDED.spot_usd_close,
+                 source = EXCLUDED.source,
+                 updated_at = NOW()
+               WHERE gold_prices.source <> 'CME settlement (MTD PDF)'`,
+              [day, price]
+            );
+            spotNote = `$${price} @ ${day}`;
+          }
+        }
+      } catch (e: any) {
+        console.error('[prices/sync] spot fetch failed:', e.message);
+      }
+
+      await pool.query(
+        `UPDATE gold_prices g SET
+           daily_change_usd = sub.chg,
+           daily_change_pct = sub.pct
+         FROM (
+           SELECT date,
+                  ROUND((spot_usd_close - LAG(spot_usd_close) OVER (ORDER BY date))::numeric, 2) AS chg,
+                  ROUND(((spot_usd_close - LAG(spot_usd_close) OVER (ORDER BY date))
+                    / NULLIF(LAG(spot_usd_close) OVER (ORDER BY date), 0) * 100)::numeric, 2) AS pct
+           FROM gold_prices
+         ) sub
+         WHERE g.date = sub.date`
+      );
+
+      const stat = await pool.query(`SELECT COUNT(*)::int AS n, MIN(date) AS min, MAX(date) AS max FROM gold_prices`);
       res.json({
         ok: true,
-        source: 'metals_summary.settlement (CME MTD PDF)',
-        rowCount: r.rows[0]?.n ?? 0,
-        latestDate: r.rows[0]?.latest ?? null,
-        note: 'Prices are synced as part of /api/cme/sync — no separate fetch needed.',
+        rows: stat.rows[0].n, from: stat.rows[0].min, to: stat.rows[0].max,
+        spot: spotNote,
+        sources: ['CME settlement (MTD PDF)', 'gold-api.com spot'],
       });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -2090,7 +2137,7 @@ async function startServer() {
 
           await pool.query(
             `INSERT INTO etf_holdings (date, ticker, name, tonnes, change_tonnes, oz, source)
-             VALUES ($1, $2, $3, $4, $5, $6, 'WGC/Issuer baseline')
+             VALUES ($1, $2, $3, $4, $5, $6, 'manual baseline (approximate)')
              ON CONFLICT (date, ticker) DO UPDATE SET
                tonnes = EXCLUDED.tonnes,
                change_tonnes = EXCLUDED.change_tonnes,
@@ -2102,7 +2149,12 @@ async function startServer() {
         }
       }
 
-      res.json({ ok: true, inserted, source: 'WGC/Issuer baseline', tickers: Object.keys(ETF_BASELINE) });
+      res.json({
+        ok: true, inserted,
+        source: 'manual baseline (approximate)',
+        tickers: Object.keys(ETF_BASELINE),
+        note: 'No free machine-readable daily feed found for ETF tonnes (SPDR moved its CSV, CME/issuer APIs are bot-gated). Values are approximate monthly baselines — treat recent months as estimates, not measurements.',
+      });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -2219,47 +2271,42 @@ async function startServer() {
   // ── Open Interest Endpoints ──────────────────────────────────────────────────
 
   // GET /api/oi/sync — seed baseline OI data
+  // GET /api/oi/sync — REAL feed (2026-08-04): CFTC Commitments of Traders,
+  // COMEX gold futures open interest (contracts of 100 oz). Weekly cadence
+  // (Tuesday data, published Friday). The previous daily "CME preliminary"
+  // array was fabricated placeholder data — those rows are purged on sync.
   app.get("/api/oi/sync", async (_req, res) => {
     try {
-      // COMEX gold open interest (contracts) — daily data from CME preliminary reports
-      // Each contract = 100 troy oz. OI typically 400k-550k for gold.
-      const OI_DATA: Record<string, number> = {
-        '2026-02-03': 485200, '2026-02-04': 487100, '2026-02-05': 489300,
-        '2026-02-06': 491800, '2026-02-07': 488500, '2026-02-10': 486700,
-        '2026-02-11': 484200, '2026-02-12': 482800, '2026-02-13': 480100,
-        '2026-02-14': 478600, '2026-02-18': 476200, '2026-02-19': 473800,
-        '2026-02-20': 471500, '2026-02-21': 469200, '2026-02-24': 467800,
-        '2026-02-25': 470100, '2026-02-26': 472500, '2026-02-27': 474800,
-        '2026-02-28': 476300, '2026-03-03': 478900, '2026-03-04': 481200,
-        '2026-03-05': 483500, '2026-03-06': 485800, '2026-03-07': 487300,
-        '2026-03-10': 489100, '2026-03-11': 491600, '2026-03-12': 493200,
-        '2026-03-13': 495800, '2026-03-14': 498100, '2026-03-17': 500200,
-        '2026-03-18': 502500, '2026-03-19': 504100, '2026-03-20': 505800,
-        '2026-03-21': 507200, '2026-03-24': 508900, '2026-03-25': 510300,
-        '2026-03-26': 511800, '2026-03-27': 513200, '2026-03-28': 514600,
-        '2026-03-31': 515800, '2026-04-01': 517200, '2026-04-02': 518900,
-        '2026-04-03': 520100, '2026-04-04': 521500, '2026-04-07': 522800,
-        '2026-04-08': 524100, '2026-04-09': 525300, '2026-04-10': 526800,
-        '2026-04-11': 527500, '2026-04-14': 528200, '2026-04-15': 529100,
-        '2026-04-16': 529800, '2026-04-17': 530200,
-      };
-
-      let inserted = 0;
-      for (const [date, contracts] of Object.entries(OI_DATA)) {
-        const oz = contracts * 100;
-        await pool.query(
-          `INSERT INTO open_interest (date, metal, oi_contracts, oi_oz, source)
-           VALUES ($1, 'GOLD', $2, $3, 'CME preliminary')
-           ON CONFLICT (date, metal) DO UPDATE SET
-             oi_contracts = EXCLUDED.oi_contracts,
-             oi_oz = EXCLUDED.oi_oz,
-             updated_at = NOW()`,
-          [date, contracts, oz]
-        );
-        inserted++;
+      const r = await fetch('https://www.cftc.gov/dea/newcot/deafut.txt');
+      if (!r.ok) throw new Error(`CFTC HTTP ${r.status}`);
+      const txt = await r.text();
+      const line = txt.split('\n').find(l => l.startsWith('"GOLD - COMMODITY EXCHANGE INC."'));
+      if (!line) throw new Error('GOLD line not found in CFTC report');
+      const cols = line.split(',');
+      const date = cols[2]?.trim();
+      const contracts = parseInt(cols[7], 10);
+      if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(contracts) || contracts <= 0) {
+        throw new Error('Failed to parse CFTC gold OI line');
       }
-
-      res.json({ ok: true, inserted, source: 'CME preliminary OI' });
+      const purged = await pool.query(
+        `DELETE FROM open_interest WHERE metal = 'GOLD' AND source IS DISTINCT FROM 'CFTC COT (weekly)'`
+      );
+      await pool.query(
+        `INSERT INTO open_interest (date, metal, oi_contracts, oi_oz, source)
+         VALUES ($1, 'GOLD', $2, $3, 'CFTC COT (weekly)')
+         ON CONFLICT (date, metal) DO UPDATE SET
+           oi_contracts = EXCLUDED.oi_contracts,
+           oi_oz = EXCLUDED.oi_oz,
+           source = EXCLUDED.source,
+           updated_at = NOW()`,
+        [date, contracts, contracts * 100]
+      );
+      res.json({
+        ok: true, date, contracts, oz: contracts * 100,
+        purgedFabricatedRows: purged.rowCount,
+        source: 'CFTC COT (weekly)',
+        cadence: 'weekly — Tuesday positions, published Friday',
+      });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -2577,45 +2624,38 @@ async function startServer() {
 
   // ── DXY (US Dollar Index) ──────────────────────────────────────────────────
 
+  // GET /api/dxy/sync — REAL feed (2026-08-04): FRED series DTWEXBGS
+  // (Fed trade-weighted broad USD index, daily, keyless CSV). Note: this is
+  // the Fed broad index (~120 level), NOT the ICE DXY (~100 level) — the old
+  // "seed" rows at DXY-like levels were fabricated and are purged on sync.
   app.get("/api/dxy/sync", async (_req, res) => {
     try {
-      // Seed DXY data aligned with our gold price date range (Feb-Apr 2026)
-      // DXY shows inverse correlation with gold — dollar weakening = gold rising
-      const DXY_DATA: Record<string, number> = {
-        '2026-02-03': 104.2, '2026-02-04': 104.0, '2026-02-05': 103.8,
-        '2026-02-06': 103.5, '2026-02-07': 103.7, '2026-02-10': 103.3,
-        '2026-02-11': 103.1, '2026-02-12': 102.9, '2026-02-13': 102.6,
-        '2026-02-14': 102.8, '2026-02-18': 102.4, '2026-02-19': 102.1,
-        '2026-02-20': 101.9, '2026-02-21': 102.2, '2026-02-24': 101.7,
-        '2026-02-25': 101.5, '2026-02-26': 101.3, '2026-02-27': 101.0,
-        '2026-02-28': 101.2, '2026-03-03': 100.8, '2026-03-04': 100.5,
-        '2026-03-05': 100.3, '2026-03-06': 100.1, '2026-03-07': 100.4,
-        '2026-03-10': 99.8, '2026-03-11': 99.6, '2026-03-12': 99.3,
-        '2026-03-13': 99.1, '2026-03-14': 99.4, '2026-03-17': 98.9,
-        '2026-03-18': 98.7, '2026-03-19': 98.5, '2026-03-20': 98.2,
-        '2026-03-21': 98.4, '2026-03-24': 98.0, '2026-03-25': 97.8,
-        '2026-03-26': 97.6, '2026-03-27': 97.3, '2026-03-28': 97.5,
-        '2026-03-31': 97.1, '2026-04-01': 96.9, '2026-04-02': 96.7,
-        '2026-04-03': 96.4, '2026-04-04': 96.6, '2026-04-07': 96.2,
-        '2026-04-08': 96.0, '2026-04-09': 95.8, '2026-04-10': 95.5,
-        '2026-04-11': 95.7, '2026-04-14': 95.3, '2026-04-15': 95.1,
-        '2026-04-16': 94.9, '2026-04-17': 94.7,
-      };
-
+      const r = await fetch('https://fred.stlouisfed.org/graph/fredgraph.csv?id=DTWEXBGS');
+      if (!r.ok) throw new Error(`FRED HTTP ${r.status}`);
+      const csv = await r.text();
+      const purged = await pool.query(
+        `DELETE FROM dxy_index WHERE source IS DISTINCT FROM 'FRED DTWEXBGS'`
+      );
       let inserted = 0;
-      for (const [date, close] of Object.entries(DXY_DATA)) {
+      for (const raw of csv.split('\n').slice(1)) {
+        const [date, val] = raw.trim().split(',');
+        if (!date || !val || val === '.') continue;
+        if (date < '2024-01-01') continue;
+        const close = Number(val);
+        if (!Number.isFinite(close)) continue;
         await pool.query(
           `INSERT INTO dxy_index (date, close, source)
-           VALUES ($1, $2, 'seed')
+           VALUES ($1, $2, 'FRED DTWEXBGS')
            ON CONFLICT (date) DO UPDATE SET
-             close = EXCLUDED.close,
-             updated_at = NOW()`,
+             close = EXCLUDED.close, source = EXCLUDED.source, updated_at = NOW()`,
           [date, close]
         );
         inserted++;
       }
-
-      res.json({ ok: true, inserted, source: 'DXY index' });
+      res.json({
+        ok: true, inserted, purgedSeedRows: purged.rowCount,
+        source: 'FRED DTWEXBGS (Fed broad USD index, daily)',
+      });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

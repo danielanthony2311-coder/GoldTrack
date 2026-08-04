@@ -74,7 +74,7 @@ export default function GoldVsDxy({ refreshKey }: Props) {
   if (data.length < 3) {
     return (
       <div className="glass-card p-6">
-        <h3 className="font-semibold text-lg mb-2">Gold vs DXY</h3>
+        <h3 className="font-semibold text-lg mb-2">Gold vs USD Index</h3>
         <p className="text-sm text-zinc-500">No data yet — fills automatically after the nightly sync.</p>
       </div>
     );
@@ -96,7 +96,7 @@ export default function GoldVsDxy({ refreshKey }: Props) {
         <div>
           <div className="flex items-center gap-2">
             <DollarSign className="w-5 h-5 text-gold-500" />
-            <h3 className="font-semibold text-lg">Gold vs US Dollar Index (DXY)</h3>
+            <h3 className="font-semibold text-lg">Gold vs USD Index (Fed broad)</h3>
           </div>
           <p className="text-xs text-zinc-500 mt-1">
             Inverse correlation — when the dollar weakens, gold typically rises
@@ -105,7 +105,7 @@ export default function GoldVsDxy({ refreshKey }: Props) {
         <div className="group relative">
           <Info className="w-4 h-4 text-zinc-600 cursor-help" />
           <div className="absolute top-full right-0 mt-2 w-72 p-3 bg-zinc-900 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 leading-relaxed opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 shadow-xl">
-            <p className="mb-2"><strong>DXY</strong> = US Dollar Index, measuring the dollar against a basket of 6 major currencies (EUR, JPY, GBP, CAD, SEK, CHF).</p>
+            <p className="mb-2"><strong>USD Index</strong> = the Fed\u2019s trade-weighted broad dollar index (FRED DTWEXBGS, daily) \u2014 the dollar against a broad basket of trading-partner currencies. Levels run ~120, unlike the ICE DXY\u2019s ~100.</p>
             <p className="mb-2">Gold and the dollar usually move <strong>inversely</strong>. When DXY drops, gold gets cheaper in other currencies, boosting global demand.</p>
             <p>A <strong>divergence</strong> — gold flat while DXY drops — can signal a pending gold breakout. Gold rising WITH a strong dollar is an even more bullish signal.</p>
           </div>
@@ -121,7 +121,7 @@ export default function GoldVsDxy({ refreshKey }: Props) {
           </p>
         </div>
         <div className="p-3 rounded-xl bg-zinc-950/60 border border-zinc-800/60">
-          <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">DXY</p>
+          <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider mb-1">USD Index</p>
           <p className="text-xl font-black text-zinc-100">{latestDxy?.toFixed(1)}</p>
           <p className={cn("text-[10px] font-bold", dxyChange >= 0 ? "text-emerald-400" : "text-rose-400")}>
             {dxyChange >= 0 ? '+' : ''}{dxyChange.toFixed(1)}%
